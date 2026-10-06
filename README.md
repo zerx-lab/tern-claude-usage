@@ -4,9 +4,9 @@
 
 See your Claude Pro / Max subscription limits live, right inside the Tern terminal — no browser tab, no guessing when your 5-hour window resets.
 
-```
-5h 42% (2h13m) · 7d 18%
-```
+![Claude Usage panel next to a terminal, with the status bar segment at bottom right](assets/usage-panel.png)
+
+Per-window progress bars with an elapsed-time marker, pace vs. even usage, reset countdowns, per-model weekly limits and extra-usage credits — plus a `5h 48% (38m) · 7d 48%` segment in the status bar.
 
 ## Features
 

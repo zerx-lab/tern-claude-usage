@@ -2,6 +2,8 @@
 
 在 Tern 里实时查看 Claude Pro / Max 订阅额度：5 小时窗口、7 天窗口、分模型周额度（Opus / Sonnet / Fable …）、额外用量（usage credits）以及促销类额度，并支持直接在面板里 OAuth 登录订阅账户。
 
+![Claude Usage 面板与状态栏](assets/usage-panel.png)
+
 ## 安装
 
 ```sh
