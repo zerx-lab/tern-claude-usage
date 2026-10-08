@@ -1,5 +1,6 @@
 --!strict
--- Normalizes `GET /api/oauth/usage` payloads into a list of quota windows plus extra-usage spend.
+-- Normalizes Claude's `GET /api/oauth/usage` and ChatGPT's `GET /backend-api/wham/usage` payloads
+-- into a list of quota windows plus extra-usage spend or credits.
 --
 -- Payload facts (see README): `utilization`/`percent` are 0–100, `resets_at` is ISO-8601 or null.
 -- `five_hour`/`seven_day` are the legacy buckets; `limits[]` carries the same windows plus
@@ -32,6 +33,8 @@ export type Window = {
 	-- Dollar buckets: `limit_dollars` / `used_dollars` / `remaining_dollars`.
 	dollars: { used: number?, limit: number?, remaining: number? }?,
 	locked: string?,
+	-- Label-column text when the label doesn't shorten by the Claude rules.
+	short: string?,
 }
 
 export type Extra = {
@@ -43,9 +46,18 @@ export type Extra = {
 	reason: string?,
 }
 
+-- ChatGPT credits: shown only when the account has some or is unlimited.
+export type Credits = {
+	balance: number?,
+	unlimited: boolean,
+}
+
 export type Usage = {
 	windows: { Window },
 	extra: Extra?,
+	credits: Credits?,
+	-- Plan label the payload itself reports (ChatGPT `plan_type`).
+	plan: string?,
 }
 
 local function num(v: any): number?
@@ -268,6 +280,108 @@ function M.parse(payload: any): Usage?
 	end
 
 	return { windows = windows, extra = parse_extra(payload) }
+end
+
+-- `5h`, `7d`, `90m`: a window length for the label column.
+local function span_text(seconds: number): string
+	if seconds % 86400 == 0 then
+		return string.format("%dd", seconds // 86400)
+	elseif seconds % HOUR == 0 then
+		return string.format("%dh", seconds // HOUR)
+	end
+	return string.format("%dm", math.max(1, seconds // 60))
+end
+
+local SPAN_LABEL = { [5 * HOUR] = "5 小时", [M.WEEK] = "7 天" }
+
+-- The windows of one wham `rate_limit` object (`primary_window`, `secondary_window`). Which slot
+-- holds which length varies by plan (free and some paid plans only have a 7-day primary), so
+-- windows are named by `limit_window_seconds` and listed shortest first.
+local function codex_windows(rate: any, now: number, group: string?): { Window }
+	local out: { Window } = {}
+	if type(rate) ~= "table" then
+		return out
+	end
+	for _, slot in { "primary_window", "secondary_window" } do
+		local w = rate[slot]
+		if type(w) ~= "table" then
+			continue
+		end
+		local pct = clamp_pct(num(w.used_percent))
+		local resets = num(w.reset_at) or (if num(w.reset_after_seconds) then now + (w.reset_after_seconds :: number) else nil)
+		local seconds = num(w.limit_window_seconds)
+		if pct == nil and resets == nil then
+			continue
+		end
+		local span = if seconds then span_text(seconds) else slot
+		local label = if seconds and SPAN_LABEL[seconds] then SPAN_LABEL[seconds] else span
+		local main = group == nil and (seconds == 5 * HOUR or seconds == M.WEEK)
+		table.insert(out, {
+			id = if group then group .. ":" .. span else span,
+			label = if group then label .. " · " .. group else label,
+			kind = if main and seconds == 5 * HOUR then "session" elseif main then "weekly" elseif group then "scoped" else "other",
+			pct = pct,
+			resets_at = resets,
+			duration = seconds,
+			short = if group then span .. " " .. group else span,
+		})
+	end
+	table.sort(out, function(a, b)
+		return (a.duration or math.huge) < (b.duration or math.huge)
+	end)
+	return out
+end
+
+local CODEX_PLANS = {
+	free = "Free",
+	go = "Go",
+	plus = "Plus",
+	pro = "Pro",
+	prolite = "Pro Lite",
+	team = "Team",
+	business = "Business",
+	enterprise = "Enterprise",
+	edu = "Edu",
+}
+
+-- Plan label of a ChatGPT `plan_type`.
+function M.codex_plan(plan_type: string?): string?
+	if plan_type == nil or plan_type == "" then
+		return nil
+	end
+	local p = plan_type :: string
+	return CODEX_PLANS[p] or (string.upper(string.sub(p, 1, 1)) .. string.sub(p, 2))
+end
+
+-- The windows and credits of one wham/usage payload; `now` resolves relative resets. Nil when
+-- `payload` isn't a usage body.
+function M.parse_codex(payload: any, now: number): Usage?
+	if type(payload) ~= "table" or (payload.rate_limit == nil and payload.plan_type == nil and payload.credits == nil) then
+		return nil
+	end
+	local windows = codex_windows(payload.rate_limit, now, nil)
+	for _, w in codex_windows(payload.code_review_rate_limit, now, "Review") do
+		table.insert(windows, w)
+	end
+	if type(payload.additional_rate_limits) == "table" then
+		for _, extra in payload.additional_rate_limits do
+			if type(extra) == "table" then
+				local name = str(extra.limit_name) or str(extra.metered_feature) or "其他"
+				for _, w in codex_windows(extra.rate_limit, now, name) do
+					table.insert(windows, w)
+				end
+			end
+		end
+	end
+	local credits: Credits? = nil
+	local c = payload.credits
+	if type(c) == "table" then
+		local balance = num(c.balance) or (if type(c.balance) == "string" then tonumber(c.balance) else nil)
+		if c.unlimited == true or c.has_credits == true or (balance and balance > 0) then
+			credits = { balance = balance, unlimited = c.unlimited == true }
+		end
+	end
+	return { windows = windows, credits = credits, plan = M.codex_plan(str(payload.plan_type)) }
 end
 
 export type Pace = {

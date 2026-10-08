@@ -1,29 +1,28 @@
 --!strict
 -- Where OAuth tokens come from:
---   own          accounts this plugin logged in; stored in <data>/accounts.json (mode 600); refreshed here.
+--   own          Claude accounts this plugin logged in; stored in <data>/accounts.json (mode 600);
+--                refreshed here.
 --   claude-code  Claude Code's login (macOS Keychain "Claude Code-credentials", else
 --                <config>/.credentials.json); refreshed only once expired, and the rotated pair
 --                is written back so Claude Code stays logged in.
---   omp          omp's ~/.omp/agent/agent.db rows; read-only (refreshing would log omp out).
+--   codex        Codex CLI's ChatGPT login ($CODEX_HOME/auth.json, default ~/.codex); refreshed
+--                only once expired, written back the same way.
+--   omp          omp's ~/.omp/agent/agent.db rows (Anthropic and ChatGPT); read-only (refreshing
+--                would log omp out).
 
+local codex = require("./codex")
 local crypto = require("./crypto")
+local oauth = require("./oauth")
 
-type Tokens = {
-	access: string,
-	refresh: string?,
-	expires: number?,
-	scopes: { string }?,
-	account_uuid: string?,
-	email: string?,
-	org_uuid: string?,
-	org_name: string?,
-}
+type Tokens = oauth.Tokens
 
 local M = {}
 
 export type Account = {
 	id: string,
-	-- "own" | "claude-code" | "omp"
+	-- "claude" | "gpt"
+	provider: string,
+	-- "own" | "claude-code" | "codex" | "omp"
 	kind: string,
 	tokens: Tokens?,
 	-- Tier or subscription hints the source already knows.
@@ -74,7 +73,7 @@ function M.own_list(): { Account }
 	end
 	for _, a in doc.accounts do
 		if type(a) == "table" and type(a.id) == "string" and type(a.tokens) == "table" and type(a.tokens.access) == "string" then
-			table.insert(out, { id = a.id, kind = "own", tokens = a.tokens, tier = a.tier, added_at = a.added_at })
+			table.insert(out, { id = a.id, provider = "claude", kind = "own", tokens = a.tokens, tier = a.tier, added_at = a.added_at })
 		end
 	end
 	return out
@@ -102,7 +101,7 @@ function M.own_upsert(tokens: Tokens): string
 		end
 	end
 	local id = "own:" .. crypto.hex(crypto.sha256((tokens.account_uuid or tokens.access) .. "|" .. (tokens.org_uuid or ""))):sub(1, 12)
-	table.insert(list, { id = id, kind = "own", tokens = tokens, added_at = os.time() })
+	table.insert(list, { id = id, provider = "claude", kind = "own", tokens = tokens, added_at = os.time() })
 	own_write(list)
 	return id
 end
@@ -150,6 +149,7 @@ local function from_claude_doc(doc: any, store: string): Account?
 	end
 	return {
 		id = "claude-code",
+		provider = "claude",
 		kind = "claude-code",
 		store = store,
 		tokens = {
@@ -242,39 +242,101 @@ function M.claude_code_cache(): any
 	return out
 end
 
+-- ── Codex CLI ───────────────────────────────────────────────────────────────
+
+local function codex_auth_path(): string
+	local dir = tern.getenv("CODEX_HOME")
+	return (if dir and dir ~= "" then dir else home() .. "/.codex") .. "/auth.json"
+end
+
+-- Reads Codex CLI's ChatGPT login. `cb(account?, raw_doc?)`; nil when Codex isn't logged in with
+-- ChatGPT here (no file, or an API-key login).
+function M.codex_load(cb: (Account?, any) -> ())
+	local doc = read_json(codex_auth_path())
+	local t = if type(doc) == "table" and type(doc.tokens) == "table" then doc.tokens else nil
+	if t == nil or type(t.access_token) ~= "string" or t.access_token == "" then
+		cb(nil, doc)
+		return
+	end
+	local tokens = codex.tokens(t.access_token, t.refresh_token, t.id_token, t.account_id)
+	cb({
+		id = "codex",
+		provider = "gpt",
+		kind = "codex",
+		store = "file",
+		tokens = tokens,
+		subscription = codex.plan_claim(tokens),
+	}, doc)
+end
+
+-- Writes refreshed tokens back into auth.json (mode 600, as Codex keeps it), keeping every other
+-- field. `cb(err?)`.
+function M.codex_save(_account: Account, doc: any, tokens: Tokens, cb: (string?) -> ())
+	local out = if type(doc) == "table" then doc else {}
+	local t = if type(out.tokens) == "table" then out.tokens else {}
+	t.access_token = tokens.access
+	t.refresh_token = tokens.refresh
+	t.id_token = tokens.id_token
+	t.account_id = t.account_id or tokens.org_uuid
+	out.tokens = t
+	out.last_refresh = os.date("!%Y-%m-%dT%H:%M:%SZ")
+	local path = codex_auth_path()
+	local ok, err = pcall(tern.fs.write, path, tern.json.encode(out, true))
+	if not ok then
+		cb("写回 Codex 登录失败: " .. tostring(err))
+		return
+	end
+	pcall(tern.process.run, { "chmod", "600", path }, {}, function(_r) end)
+	cb(nil)
+end
+
 -- ── omp ─────────────────────────────────────────────────────────────────────
 
--- omp's Anthropic OAuth rows. `cb(accounts)`; empty when omp or sqlite3 is missing.
+local OMP_PROVIDERS = { anthropic = "claude", ["openai-codex"] = "gpt" }
+
+-- omp's Anthropic and ChatGPT OAuth rows. `cb(accounts)`; empty when omp or sqlite3 is missing.
 function M.omp_load(cb: ({ Account }) -> ())
 	local db = home() .. "/.omp/agent/agent.db"
 	if not tern.fs.exists(db) then
 		cb({})
 		return
 	end
-	local sql = "select id, data, disabled_cause from auth_credentials where provider = 'anthropic' and credential_type = 'oauth' order by id"
+	local sql = "select id, provider, data, disabled_cause from auth_credentials where provider in ('anthropic', 'openai-codex') and credential_type = 'oauth' order by id"
 	local ok = pcall(tern.process.run, { "sqlite3", "-readonly", "-json", db, sql }, { timeout_ms = 10000 }, function(r)
 		local out: { Account } = {}
 		if r.status == 0 then
 			local okj, rows = pcall(tern.json.decode, if r.stdout == "" then "[]" else r.stdout)
 			if okj and type(rows) == "table" then
 				for _, row in rows do
+					local provider = OMP_PROVIDERS[row.provider]
 					local okd, data = pcall(tern.json.decode, row.data or "")
-					if okd and type(data) == "table" and type(data.access) == "string" then
-						table.insert(out, {
-							id = "omp:" .. tostring(row.id),
-							kind = "omp",
-							tokens = {
-								access = data.access,
-								refresh = data.refresh,
-								expires = data.expires,
-								account_uuid = data.accountId,
-								email = data.email,
-								org_uuid = data.orgId,
-								org_name = data.orgName,
-							},
-							problem = if type(row.disabled_cause) == "string" and row.disabled_cause ~= "" then row.disabled_cause else nil,
-						})
+					if provider == nil or not okd or type(data) ~= "table" or type(data.access) ~= "string" then
+						continue
 					end
+					local tokens: Tokens
+					if provider == "gpt" then
+						tokens = codex.tokens(data.access, data.refresh, nil, data.accountId)
+						tokens.expires = if type(data.expires) == "number" then data.expires else tokens.expires
+						tokens.email = data.email or tokens.email
+					else
+						tokens = {
+							access = data.access,
+							refresh = data.refresh,
+							expires = data.expires,
+							account_uuid = data.accountId,
+							email = data.email,
+							org_uuid = data.orgId,
+							org_name = data.orgName,
+						}
+					end
+					table.insert(out, {
+						id = "omp:" .. tostring(row.id),
+						provider = provider,
+						kind = "omp",
+						tokens = tokens,
+						subscription = if provider == "gpt" then codex.plan_claim(tokens) else nil,
+						problem = if type(row.disabled_cause) == "string" and row.disabled_cause ~= "" then row.disabled_cause else nil,
+					})
 				end
 			end
 		end

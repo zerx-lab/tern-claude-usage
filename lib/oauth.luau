@@ -29,6 +29,8 @@ export type Tokens = {
 	email: string?,
 	org_uuid: string?,
 	org_name: string?,
+	-- ChatGPT only: the OpenID token Codex keeps beside the access token.
+	id_token: string?,
 }
 
 export type Pkce = { verifier: string, challenge: string, state: string }

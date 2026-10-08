@@ -1,12 +1,13 @@
 --!strict
 -- One poller per host VM, shared by every open usage block and the status line.
 --
--- Each tick re-reads the credential sources (so Claude Code's own refreshes and new logins show
--- up), then fetches `/api/oauth/usage` for each account, one after another. It ticks every
--- `settings.interval` seconds while a usage block is open and every `settings.background`
--- seconds otherwise. A 429 backs that account off (Retry-After, else doubling from one minute)
--- and keeps showing the last good data.
+-- Each tick re-reads the credential sources (so Claude Code's and Codex's own refreshes and new
+-- logins show up), then fetches each account's usage (Claude `/api/oauth/usage`, ChatGPT
+-- `wham/usage`), one after another. It ticks every `settings.interval` seconds while a usage block
+-- is open and every `settings.background` seconds otherwise. A 429 backs that account off
+-- (Retry-After, else doubling from one minute) and keeps showing the last good data.
 
+local codex = require("./codex")
 local creds = require("./creds")
 local oauth = require("./oauth")
 local usage = require("./usage")
@@ -40,11 +41,16 @@ export type Settings = {
 	interval: number,
 	background: number,
 	claude_code: boolean,
+	codex: boolean,
 	omp: boolean,
 	status_line: boolean,
+	-- The tab blocks open on and the status line shows: "claude" | "gpt".
+	provider: string,
 }
 
-local DEFAULTS: Settings = { interval = 60, background = 300, claude_code = true, omp = true, status_line = true }
+local DEFAULTS: Settings = { interval = 60, background = 300, claude_code = true, codex = true, omp = true, status_line = true, provider = "claude" }
+M.PROVIDERS = { "claude", "gpt" }
+M.PROVIDER_NAME = { claude = "Claude", gpt = "GPT" }
 M.INTERVALS = { 30, 60, 120, 300, 600 }
 local HISTORY = 48
 
@@ -74,6 +80,9 @@ local function load_settings()
 				(state.settings :: any)[k] = v
 			end
 		end
+	end
+	if not M.PROVIDER_NAME[state.settings.provider] then
+		state.settings.provider = DEFAULTS.provider
 	end
 end
 
@@ -112,14 +121,15 @@ local function load_cache()
 	end
 end
 
--- Compact status for the window half's status line, in kv "status".
+-- Compact status for the window half's status line, in kv "status": every account's 5 h / 7 d
+-- windows, and the provider the line shows.
 local function publish()
 	local accounts = {}
 	for _, e in state.entries do
 		if e.duplicate_of or e.account.problem then
 			continue
 		end
-		local row: { [string]: any } = { label = M.label(e), plan = M.plan(e), error = e.error }
+		local row: { [string]: any } = { provider = e.account.provider, label = M.label(e), plan = M.plan(e), error = e.error }
 		if e.usage then
 			for _, w in (e.usage :: usage.Usage).windows do
 				if w.id == "5h" or w.id == "7d" then
@@ -130,7 +140,12 @@ local function publish()
 		end
 		table.insert(accounts, row)
 	end
-	pcall(tern.kv.set, "status", { updated = os.time(), accounts = tern.json.array(accounts), enabled = state.settings.status_line })
+	pcall(tern.kv.set, "status", {
+		updated = os.time(),
+		accounts = tern.json.array(accounts),
+		enabled = state.settings.status_line,
+		provider = state.settings.provider,
+	})
 end
 
 -- ── listeners ───────────────────────────────────────────────────────────────
@@ -172,11 +187,17 @@ end
 function M.label(e: Entry): string
 	local p = e.profile
 	local t = e.account.tokens
-	return (p and p.email) or (t and t.email) or (if e.account.kind == "claude-code" then "Claude Code 账户" else e.account.id)
+	local fallback = if e.account.kind == "claude-code" then "Claude Code 账户" elseif e.account.kind == "codex" then "Codex 账户" else e.account.id
+	return (p and p.email) or (t and t.email) or fallback
 end
 
--- The live profile wins over tier hints a credential store saved at login time.
+-- Claude: the live profile wins over tier hints a credential store saved at login time.
+-- ChatGPT: the plan the last usage payload reported, else the token's plan claim.
 function M.plan(e: Entry): string?
+	if e.account.provider == "gpt" then
+		local u = e.usage
+		return (u and u.plan) or usage.codex_plan(e.account.subscription)
+	end
 	local p = e.profile
 	return usage.plan((p and p.tier) or e.account.tier, e.account.subscription, p and p.org_type)
 end
@@ -187,7 +208,7 @@ local function identity(e: Entry): string?
 	if not acc then
 		return nil
 	end
-	return acc .. "|" .. ((p and p.org_uuid) or (t and t.org_uuid) or "")
+	return e.account.provider .. "|" .. acc .. "|" .. ((p and p.org_uuid) or (t and t.org_uuid) or "")
 end
 
 local function mark_duplicates()
@@ -207,8 +228,15 @@ end
 
 -- ── data ────────────────────────────────────────────────────────────────────
 
+local function parse_raw(account: creds.Account, raw: any, fetched_at: number): usage.Usage?
+	if account.provider == "gpt" then
+		return usage.parse_codex(raw, fetched_at)
+	end
+	return usage.parse(raw)
+end
+
 local function record(e: Entry, raw: any, fetched_at: number, source: string)
-	local parsed = usage.parse(raw)
+	local parsed = parse_raw(e.account, raw, fetched_at)
 	if not parsed then
 		e.error = "用量响应格式无法识别"
 		return
@@ -244,19 +272,20 @@ local function new_entry(account: creds.Account): Entry
 			end
 		end
 		if c.raw ~= nil and type(c.fetched_at) == "number" then
-			e.raw, e.usage, e.fetched_at, e.data_source = c.raw, usage.parse(c.raw), c.fetched_at, "disk"
+			e.raw, e.usage, e.fetched_at, e.data_source = c.raw, parse_raw(account, c.raw, c.fetched_at), c.fetched_at, "disk"
 		end
 	end
 	return e
 end
 
-local ORDER = { own = 1, ["claude-code"] = 2, omp = 3 }
+local ORDER = { own = 1, ["claude-code"] = 2, codex = 2, omp = 3 }
+local PROVIDER_ORDER = { claude = 1, gpt = 2 }
 
 -- Re-reads every source and merges the accounts into `state.entries`, keeping per-entry state.
 function M.reload_accounts(done: () -> ())
 	local found: { creds.Account } = creds.own_list()
 	local docs: { [string]: any } = {}
-	local pending = 2
+	local pending = 3
 	local function finish()
 		pending -= 1
 		if pending > 0 then
@@ -276,6 +305,10 @@ function M.reload_accounts(done: () -> ())
 			table.insert(next_entries, e)
 		end
 		table.sort(next_entries, function(x, y)
+			local px, py = PROVIDER_ORDER[x.account.provider] or 9, PROVIDER_ORDER[y.account.provider] or 9
+			if px ~= py then
+				return px < py
+			end
 			local ox, oy = ORDER[x.account.kind] or 9, ORDER[y.account.kind] or 9
 			if ox ~= oy then
 				return ox < oy
@@ -288,6 +321,17 @@ function M.reload_accounts(done: () -> ())
 	end
 	if state.settings.claude_code then
 		creds.claude_code_load(function(acc, doc)
+			if acc then
+				table.insert(found, acc)
+				docs[acc.id] = doc
+			end
+			finish()
+		end)
+	else
+		finish()
+	end
+	if state.settings.codex then
+		creds.codex_load(function(acc, doc)
 			if acc then
 				table.insert(found, acc)
 				docs[acc.id] = doc
@@ -313,6 +357,13 @@ local function now_ms(): number
 	return os.time() * 1000
 end
 
+-- Where a CLI's login is re-read before a refresh and written back after it; `refresh` is the
+-- provider's token endpoint.
+local CLI = {
+	["claude-code"] = { load = creds.claude_code_load, save = creds.claude_code_save, refresh = oauth.refresh, name = "Claude Code" },
+	codex = { load = creds.codex_load, save = creds.codex_save, refresh = codex.refresh, name = "Codex" },
+}
+
 -- Calls `cb(access)` with a usable access token, refreshing it when it's expired (or `force`).
 local function ensure_token(e: Entry, force: boolean, cb: (string?, string?) -> ())
 	local t = e.account.tokens
@@ -328,13 +379,15 @@ local function ensure_token(e: Entry, force: boolean, cb: (string?, string?) -> 
 	end
 	local kind = e.account.kind
 	if kind == "omp" then
-		cb(nil, "omp 中的登录已过期：在 omp 里重新登录，或在这里用 l 登录")
+		cb(nil, "omp 中的登录已过期：在 omp 里重新登录" .. (if e.account.provider == "claude" then "，或在这里用 l 登录" else ""))
 		return
 	end
+	local cli = CLI[kind]
+	local refresh = if cli then cli.refresh else oauth.refresh
 	e.busy = "refresh"
 	M.notify()
 	local function do_refresh(current: oauth.Tokens)
-		oauth.refresh(current, function(new, err, invalid)
+		refresh(current, function(new, err, invalid)
 			e.busy = nil
 			if not new then
 				cb(nil, (if invalid then "登录已失效，需要重新登录" else "刷新令牌失败") .. "（" .. tostring(err) .. "）")
@@ -342,23 +395,23 @@ local function ensure_token(e: Entry, force: boolean, cb: (string?, string?) -> 
 			end
 			local fresh_tokens = new :: oauth.Tokens
 			e.account.tokens = fresh_tokens
-			if kind == "own" then
+			if not cli then
 				creds.own_update(e.account.id, fresh_tokens)
 				cb(fresh_tokens.access)
-			else
-				creds.claude_code_save(e.account, e.doc, fresh_tokens, function(werr)
-					if werr then
-						tern.log.warn("claude-usage: Claude Code write-back failed", werr)
-						e.error = werr
-					end
-					cb(fresh_tokens.access)
-				end)
+				return
 			end
+			cli.save(e.account, e.doc, fresh_tokens, function(werr)
+				if werr then
+					tern.log.warn("claude-usage: " .. cli.name .. " write-back failed", werr)
+					e.error = werr
+				end
+				cb(fresh_tokens.access)
+			end)
 		end)
 	end
-	if kind == "claude-code" then
-		-- Claude Code may have refreshed on its own since the last read; use that if so.
-		creds.claude_code_load(function(acc, doc)
+	if cli then
+		-- The CLI may have refreshed on its own since the last read; use that if so.
+		cli.load(function(acc, doc)
 			if acc and acc.tokens then
 				local latest = acc.tokens :: oauth.Tokens
 				e.account.tokens, e.doc = latest, doc
@@ -370,7 +423,7 @@ local function ensure_token(e: Entry, force: boolean, cb: (string?, string?) -> 
 				do_refresh(latest)
 			else
 				e.busy = nil
-				cb(nil, "读取 Claude Code 登录失败")
+				cb(nil, "读取 " .. cli.name .. " 登录失败")
 			end
 		end)
 	else
@@ -394,6 +447,30 @@ local function fetch_profile(e: Entry, access: string, done: () -> ())
 		end
 		done()
 	end)
+end
+
+-- ChatGPT has no profile call; the usage payload names the user, the account and the email.
+local function codex_profile(e: Entry, body: any)
+	if type(body) ~= "table" then
+		return
+	end
+	local t = e.account.tokens
+	e.profile = {
+		email = (if type(body.email) == "string" then body.email else nil) or (t and t.email),
+		account_uuid = (if type(body.user_id) == "string" then body.user_id else nil) or (t and t.account_uuid),
+		org_uuid = (if type(body.account_id) == "string" then body.account_id else nil) or (t and t.org_uuid),
+	}
+	mark_duplicates()
+end
+
+-- GET the entry's usage from its provider; `cb(result, body)`.
+local function get_usage(e: Entry, access: string, cb: (FetchResult, any) -> ())
+	if e.account.provider == "gpt" then
+		local t = e.account.tokens
+		codex.usage(access, t and t.org_uuid, cb)
+	else
+		oauth.get("/usage", access, cb)
+	end
 end
 
 -- Claude Code's own cached usage, when it is newer than ours and belongs to this login.
@@ -467,12 +544,17 @@ local function poll_entry(e: Entry, force: boolean, done: () -> ())
 			end
 			e.busy = "fetch"
 			M.notify()
-			oauth.get("/usage", access :: string, function(r, body)
+			get_usage(e, access :: string, function(r, body)
 				e.busy = nil
 				if r.status == 200 and body ~= nil then
 					e.error, e.backoff_until, e.backoff_step = nil, nil, 0
 					record(e, body, os.time(), "api")
-					fetch_profile(e, access :: string, done)
+					if e.account.provider == "gpt" then
+						codex_profile(e, body)
+						done()
+					else
+						fetch_profile(e, access :: string, done)
+					end
 					return
 				end
 				if r.status == 401 and not retried and e.account.kind ~= "omp" then
@@ -582,6 +664,17 @@ function M.remove_own(id: string)
 	end
 	mark_duplicates()
 	save_cache()
+	publish()
+	M.notify()
+end
+
+-- Switches the shown provider for every open block and the status line, and keeps it as the
+-- default for blocks opened later.
+function M.set_provider(provider: string)
+	if not M.PROVIDER_NAME[provider] or state.settings.provider == provider then
+		return
+	end
+	M.set_setting("provider", provider)
 	publish()
 	M.notify()
 end

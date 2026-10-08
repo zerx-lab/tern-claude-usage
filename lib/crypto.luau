@@ -85,6 +85,34 @@ function M.base64url(bytes: string): string
 	return table.concat(out)
 end
 
+local B64_INDEX: { [string]: number } = {}
+for i = 1, 64 do
+	B64_INDEX[string.sub(B64, i, i)] = i - 1
+end
+B64_INDEX["+"], B64_INDEX["/"] = 62, 63
+
+-- Bytes of base64url or standard base64 text (padding optional), as JWT segments carry.
+-- Nil when the text holds other characters.
+function M.base64url_decode(text: string): string?
+	local clean = string.gsub(text, "=+$", "")
+	local out = table.create(#clean * 3 // 4)
+	local acc, bits = 0, 0
+	for i = 1, #clean do
+		local v = B64_INDEX[string.sub(clean, i, i)]
+		if v == nil then
+			return nil
+		end
+		acc = bit32.bor(bit32.lshift(acc, 6), v)
+		bits += 6
+		if bits >= 8 then
+			bits -= 8
+			table.insert(out, string.char(bit32.band(bit32.rshift(acc, bits), 0xff)))
+			acc = bit32.band(acc, bit32.lshift(1, bits) - 1)
+		end
+	end
+	return table.concat(out)
+end
+
 -- Percent-encodes everything except RFC 3986 unreserved characters.
 function M.urlencode(text: string): string
 	return (string.gsub(text, "[^%w%-%._~]", function(c)

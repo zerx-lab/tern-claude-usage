@@ -1,6 +1,7 @@
 --!strict
--- Block `claude-usage.usage`: Claude Pro/Max quota windows (5 h, 7 d, per-model weekly, extra
--- usage) for every known login, refreshed on a timer. Launch argument "login" starts a login.
+-- Block `claude-usage.usage`: subscription quota windows of Claude Pro/Max (5 h, 7 d, per-model
+-- weekly, extra usage) and ChatGPT (Codex 5 h / 7 d, credits) for every known login, one provider
+-- per tab, refreshed on a timer. Launch argument "login" starts a Claude login.
 
 local login = require("./lib/login")
 local poller = require("./lib/poller")
@@ -15,8 +16,23 @@ local function close_flow(st: State)
 	end
 end
 
+local function show_provider(st: State, provider: string)
+	if provider ~= poller.state.settings.provider then
+		st.sel, st.confirm = 1, nil
+		poller.set_provider(provider)
+	end
+end
+
+local function next_provider(st: State)
+	local list = poller.PROVIDERS
+	local idx = table.find(list, poller.state.settings.provider) or 0
+	show_provider(st, list[idx % #list + 1])
+end
+
 local function start_login(st: State)
 	close_flow(st)
+	-- Logins are Claude accounts; show that tab so the new account appears.
+	show_provider(st, "claude")
 	local cx = st.cx
 	st.flow = login.start(cx, function()
 		cx:render()
@@ -98,6 +114,10 @@ local usage_block: BlockDef<State> = {
 		local name = key.name
 		if name == "r" then
 			poller.tick(true)
+		elseif name == "tab" then
+			next_provider(st)
+		elseif name == "1" or name == "2" then
+			show_provider(st, poller.PROVIDERS[tonumber(name) :: number])
 		elseif name == "l" then
 			start_login(st)
 		elseif name == "j" or name == "down" then
@@ -109,7 +129,7 @@ local usage_block: BlockDef<State> = {
 			if e and e.account.kind == "own" then
 				st.confirm = e.account.id
 			elseif e then
-				st.cx:toast("info", "只能移除本插件登录的账户", "Claude Code / omp 的登录请在对应工具中退出，或用 c / o 关闭来源")
+				st.cx:toast("info", "只能移除本插件登录的账户", "Claude Code / Codex / omp 的登录请在对应工具中退出，或用 c / o 关闭来源")
 			end
 		elseif name == "enter" and st.confirm then
 			poller.remove_own(st.confirm :: string)
@@ -122,7 +142,7 @@ local usage_block: BlockDef<State> = {
 		elseif name == "-" then
 			cycle_interval(-1)
 		elseif name == "c" then
-			toggle("claude_code")
+			toggle(if poller.state.settings.provider == "gpt" then "codex" else "claude_code")
 		elseif name == "o" then
 			toggle("omp")
 		elseif name == "s" then
@@ -168,6 +188,8 @@ local usage_block: BlockDef<State> = {
 			st.confirm = nil
 		elseif act == "help" then
 			st.help = not st.help
+		elseif act == "tab" and value then
+			show_provider(st, value)
 		end
 	end,
 }

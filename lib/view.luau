@@ -1,8 +1,9 @@
 --!strict
--- The usage block's view: one card per account with a one-line meter per quota window, pace
--- against an even spend, reset countdowns, extra-usage spend and a short history; plus the login
--- panel. Layout follows the pane width (`cx.cols`): text never wraps, secondary details drop out
--- as the pane narrows, and the full detail stays in tooltips.
+-- The usage block's view: Claude / GPT tabs, then one card per account of the shown provider with a
+-- one-line meter per quota window, pace against an even spend, reset countdowns, extra-usage spend
+-- or credits and a short history; plus the login panel. Layout follows the pane width (`cx.cols`):
+-- text never wraps, secondary details drop out as the pane narrows, and the full detail stays in
+-- tooltips.
 
 local poller = require("./poller")
 local time = require("./time")
@@ -66,7 +67,7 @@ local function money(v: number?, currency: string?): string
 	return sym .. string.format("%.2f", v)
 end
 
-local SOURCE = { own = "插件登录", ["claude-code"] = "Claude Code", omp = "omp" }
+local SOURCE = { own = "插件登录", ["claude-code"] = "Claude Code", codex = "Codex CLI", omp = "omp" }
 M.SOURCE = SOURCE
 
 local DATA_SOURCE = { api = "API", ["claude-code-cache"] = "CC 缓存", disk = "缓存" }
@@ -166,7 +167,7 @@ local function window_rows(w: usage.Window, now: number, fit: Fit): { Node }
 	end
 	local width = if fit.narrow then LABEL_W.narrow else LABEL_W.medium
 	table.insert(rows, ui.node("row", { gap = "sm", key = "w:" .. w.id }, {
-		line({ ui.span(short_label(w), if w.active then "strong" else "") }, { min = { w = width }, max = { w = width }, basis = "content", title = w.label .. (if w.active then "（当前生效的限制）" else "") }),
+		line({ ui.span(w.short or short_label(w), if w.active then "strong" else "") }, { min = { w = width }, max = { w = width }, basis = "content", title = w.label .. (if w.active then "（当前生效的限制）" else "") }),
 		ui.node("meter", props),
 		line({ ui.span(pct_text(w.pct), "num") }, { min = { w = "6ch" }, basis = "content", key = "pct", title = "已用 " .. pct_text(w.pct) }),
 		reset_node(w, now, fit),
@@ -213,6 +214,17 @@ local function extra_row(x: usage.Extra, fit: Fit): Node
 	return ui.node("row", { gap = "sm", key = "extra" }, {
 		label,
 		line({ ui.span(money(x.used, x.currency), "num"), ui.span(" 已用 · 无上限", "muted") }),
+	})
+end
+
+local function credits_row(c: usage.Credits, fit: Fit): Node
+	local width = if fit.narrow then LABEL_W.narrow else LABEL_W.medium
+	local value: { Span } = if c.unlimited
+		then { ui.span("无限", "success") }
+		else { ui.span(if c.balance then string.format("%g", c.balance :: number) else "—", "num"), ui.span(" credits", "muted") }
+	return ui.node("row", { gap = "sm", key = "credits" }, {
+		line({ ui.span("余额") }, { min = { w = width }, max = { w = width }, basis = "content", title = "ChatGPT credits：额度用完后按 credits 继续使用" }),
+		line(value),
 	})
 end
 
@@ -270,6 +282,9 @@ local function account_card(e: poller.Entry, selected: boolean, confirm: boolean
 		end
 		if u.extra then
 			table.insert(body, extra_row(u.extra :: usage.Extra, fit))
+		end
+		if u.credits then
+			table.insert(body, credits_row(u.credits :: usage.Credits, fit))
 		end
 		local hist = history_row(e, fit)
 		if hist then
@@ -348,12 +363,13 @@ local function login_card(flow: any, fit: Fit): Node
 end
 
 local KEYS = {
+	{ { "Tab" }, "切换 Claude / GPT（也可按 1 / 2）" },
 	{ { "r" }, "立即刷新" },
-	{ { "l" }, "登录账户" },
+	{ { "l" }, "登录 Claude 账户" },
 	{ { "j", "k" }, "选择账户" },
 	{ { "x" }, "移除插件登录的账户" },
 	{ { "+", "-" }, "刷新间隔" },
-	{ { "c" }, "开关 Claude Code 来源" },
+	{ { "c" }, "开关 Claude Code / Codex 来源（随当前标签）" },
 	{ { "o" }, "开关 omp 来源" },
 	{ { "s" }, "开关状态栏" },
 	{ { "?" }, "显示/隐藏本说明" },
@@ -374,7 +390,7 @@ local function help_card(): Node
 	return with(ui.card({ ui.span("按键与设置", "strong") }, {
 		ui.node("row", { gap = "md", wrap = true }, keys),
 		ui.node("text", { spans = {
-			ui.span(string.format("刷新 %ds（后台 %ds）· Claude Code %s · omp %s · 状态栏 %s", s.interval, s.background, onoff(s.claude_code), onoff(s.omp), onoff(s.status_line)), "muted"),
+			ui.span(string.format("刷新 %ds（后台 %ds）· Claude Code %s · Codex %s · omp %s · 状态栏 %s", s.interval, s.background, onoff(s.claude_code), onoff(s.codex), onoff(s.omp), onoff(s.status_line)), "muted"),
 		} }),
 		ui.node("text", { spans = {
 			ui.span("进度条上的竖线是窗口已过去的时间比例；用量超过它说明比均匀使用更快。悬停各行可看完整说明。", "dim"),
@@ -382,27 +398,31 @@ local function help_card(): Node
 	}), { key = "help" })
 end
 
+-- `Claude 5h 42% · 7d 18%` / `GPT 7d 9%` for the first account of the shown provider with data.
 function M.title(_st: BlockState): string?
-	for _, e in poller.state.entries do
-		if e.usage and not e.duplicate_of then
-			local s, w
+	local name = poller.PROVIDER_NAME[poller.state.settings.provider]
+	for _, e in M.visible() do
+		if e.usage then
+			local parts: { string } = {}
 			for _, win in (e.usage :: usage.Usage).windows do
-				if win.id == "5h" then
-					s = win.pct
-				elseif win.id == "7d" then
-					w = win.pct
+				if win.id == "5h" or win.id == "7d" then
+					table.insert(parts, win.id .. " " .. pct_text(win.pct))
 				end
 			end
-			return string.format("Claude 5h %s · 7d %s", pct_text(s), pct_text(w))
+			if #parts > 0 then
+				return name .. " " .. table.concat(parts, " · ")
+			end
 		end
 	end
-	return "Claude 用量"
+	return name .. " 用量"
 end
 
+-- The shown provider's accounts, one per real account.
 function M.visible(): { poller.Entry }
+	local provider = poller.state.settings.provider
 	local out: { poller.Entry } = {}
 	for _, e in poller.state.entries do
-		if not e.duplicate_of then
+		if not e.duplicate_of and e.account.provider == provider then
 			table.insert(out, e)
 		end
 	end
@@ -436,6 +456,7 @@ function M.render(st: BlockState, cx: BlockCx): BlockView
 		end
 	end
 	local s = poller.state
+	local provider = s.settings.provider
 	local main: { Node } = {}
 
 	local status: Node
@@ -446,19 +467,23 @@ function M.render(st: BlockState, cx: BlockCx): BlockView
 	else
 		status = line({ ui.span("已暂停", "dim") }, { key = "status", basis = "content", title = "状态栏关闭且面板未打开时不轮询" })
 	end
-	table.insert(main, ui.node("row", { gap = "sm", key = "head" }, {
-		line({ ui.span(if fit.narrow then "Claude" else "Claude 订阅额度", "strong") }, { grow = 1, min = { w = 0 } }),
-		status,
-		button("刷新", "accent", "refresh", "r"),
-		(function(): Node
-			local own = M.own_target(st)
-			if own then
-				return button("退出登录", "neutral", "logout", "移除插件登录的账户（需确认）")
-			end
-			return button("登录", "neutral", "login", "l：登录 Claude 订阅账户")
-		end)(),
-		button("?", "neutral", "help", "按键与设置"),
-	}))
+	local head: { Node } = {}
+	for i, p in poller.PROVIDERS do
+		local name = poller.PROVIDER_NAME[p]
+		table.insert(head, button(name, if p == provider then "accent" else "neutral", "tab=" .. p, string.format("%d / Tab：%s 订阅额度（状态栏同步显示）", i, name)))
+	end
+	table.insert(head, line({ ui.span(if fit.narrow then "" else "订阅额度", "muted") }, { grow = 1, min = { w = 0 } }))
+	table.insert(head, status)
+	table.insert(head, button("刷新", "accent", "refresh", "r"))
+	if provider == "claude" then
+		if M.own_target(st) then
+			table.insert(head, button("退出登录", "neutral", "logout", "移除插件登录的账户（需确认）"))
+		else
+			table.insert(head, button("登录", "neutral", "login", "l：登录 Claude 订阅账户"))
+		end
+	end
+	table.insert(head, button("?", "neutral", "help", "按键与设置"))
+	table.insert(main, ui.node("row", { gap = "sm", key = "head" }, head))
 
 	if st.flow then
 		table.insert(main, login_card(st.flow, fit))
@@ -471,13 +496,21 @@ function M.render(st: BlockState, cx: BlockCx): BlockView
 	for i, e in entries do
 		table.insert(main, account_card(e, i == st.sel and #entries > 1, st.confirm == e.account.id, now, fit))
 	end
-	local dups = #s.entries - #entries
+	local dups = 0
+	for _, e in s.entries do
+		if e.duplicate_of and e.account.provider == provider then
+			dups += 1
+		end
+	end
 	if dups > 0 then
 		table.insert(main, line({ ui.span(string.format("另有 %d 个来源指向同一账户，已合并", dups), "dim") }, { key = "dups" }))
 	end
 	if #entries == 0 and not s.ticking and not st.flow then
-		table.insert(main, with(ui.card({ ui.span("还没有 Claude 账户", "strong") }, {
-			ui.node("text", { spans = { ui.span("按 l 登录 Pro / Max 账户；已登录 Claude Code 时会自动读取。", "muted") } }),
+		local empty = if provider == "gpt"
+			then { "还没有 GPT 账户", "用 Codex CLI 登录 ChatGPT（codex login）或在 omp 中登录后会自动读取。" }
+			else { "还没有 Claude 账户", "按 l 登录 Pro / Max 账户；已登录 Claude Code 时会自动读取。" }
+		table.insert(main, with(ui.card({ ui.span(empty[1], "strong") }, {
+			ui.node("text", { spans = { ui.span(empty[2], "muted") } }),
 		}), { key = "empty" }))
 	end
 

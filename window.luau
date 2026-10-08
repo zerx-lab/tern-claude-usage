@@ -1,21 +1,23 @@
 --!strict
 -- Window half: palette commands that pop the usage block up as a floating panel, and a
--- status-line segment fed by the host poller's summary in kv "status".
+-- status-line segment fed by the host poller's summary in kv "status", showing the provider
+-- picked by the block's tabs.
 
 local time = require("./lib/time")
 local KIND = "claude-usage.usage"
 
 type Window = { pct: number?, resets_at: number? }
-type Row = { label: string?, plan: string?, error: string?, session: Window?, weekly: Window? }
+type Row = { provider: string?, label: string?, plan: string?, error: string?, session: Window?, weekly: Window? }
 
-local summary: { updated: number?, enabled: boolean?, accounts: { Row } }? = nil
+local summary: { updated: number?, enabled: boolean?, provider: string?, accounts: { Row } }? = nil
 
 local function read_summary(): boolean
 	local ok, s = pcall(tern.kv.get, "status")
 	if not ok or type(s) ~= "table" then
 		return false
 	end
-	local changed = summary == nil or (summary :: any).updated ~= s.updated
+	local prev = summary :: any
+	local changed = prev == nil or prev.updated ~= s.updated or prev.provider ~= s.provider
 	summary = s
 	return changed
 end
@@ -42,27 +44,49 @@ local function tone(row: Row): string?
 	return "muted"
 end
 
+-- Claude's segment keeps its bare `5h 42% (2h13m) · 7d 18%`; others are prefixed with their name.
+local PREFIX = { claude = "", gpt = "GPT " }
+local NAME = { claude = "Claude", gpt = "GPT" }
+
 tern.chrome.status(function(_pane)
 	local s = summary
-	if s == nil or s.enabled == false or #s.accounts == 0 then
+	if s == nil or s.enabled == false then
 		return nil
 	end
-	local row = s.accounts[1]
+	local provider = s.provider or "claude"
+	local rows: { Row } = {}
+	for _, r in s.accounts do
+		if (r.provider or "claude") == provider then
+			table.insert(rows, r)
+		end
+	end
+	local row = rows[1]
+	if row == nil then
+		return nil
+	end
 	if row.session == nil and row.weekly == nil then
 		if row.error then
-			return { { text = "Claude ⚠", icon = "sparkle", tone = "error", command = "plugin.claude-usage.open" } }
+			return { { text = (NAME[provider] or provider) .. " ⚠", icon = "sparkle", tone = "error", command = "plugin.claude-usage.open" } }
 		end
 		return nil
 	end
 	local now = os.time()
-	local text = "5h " .. pct(row.session)
-	local session = row.session
-	if session and session.resets_at and (session.resets_at :: number) > now then
-		text ..= " (" .. time.short((session.resets_at :: number) - now) .. ")"
+	-- The first window present (5 h, else 7 d for plans without one) carries the reset countdown.
+	local parts: { string } = {}
+	for _, item in { { "5h", row.session }, { "7d", row.weekly } } do
+		local w: Window? = item[2]
+		if w then
+			local part = item[1] .. " " .. pct(w)
+			local at = w.resets_at
+			if #parts == 0 and at and at > now then
+				part ..= " (" .. time.short(at - now) .. ")"
+			end
+			table.insert(parts, part)
+		end
 	end
-	text ..= " · 7d " .. pct(row.weekly)
-	if #s.accounts > 1 then
-		text ..= string.format(" +%d", #s.accounts - 1)
+	local text = (PREFIX[provider] or "") .. table.concat(parts, " · ")
+	if #rows > 1 then
+		text ..= string.format(" +%d", #rows - 1)
 	end
 	return { { text = text, icon = "sparkle", tone = tone(row), command = "plugin.claude-usage.open" } }
 end)
@@ -110,7 +134,7 @@ end
 
 tern.command({
 	id = "open",
-	title = "Claude 用量：显示 / 隐藏额度浮窗",
+	title = "订阅用量（Claude / GPT）：显示 / 隐藏额度浮窗",
 	icon = "sparkle",
 	run = function(cx)
 		local panel, focused = find_panel(cx)

@@ -1,5 +1,6 @@
 -- Host and window halves against a scripted runtime: refresh, 401 retry, 429 backoff, Claude Code
--- write-back, duplicate accounts, both login paths, the block view and the status segment.
+-- and Codex write-back, duplicate accounts, both login paths, the block view with its Claude / GPT
+-- tabs and the status segment.
 
 local fake = require("./fake_tern")
 local crypto = require("../lib/crypto")
@@ -459,4 +460,155 @@ do
 	eq(#env.tern.json.decode(env.files["/data/accounts.json"]).accounts, 0, "removed")
 	eq(key("q"), false, "unused key returns false")
 	print("remove: ok")
+end
+
+-- ChatGPT access tokens are JWTs; the plugin reads expiry, user, account, plan and email from them.
+local function gpt_token(env: any, exp: number, user: string, plan: string): string
+	local claims = {
+		exp = exp,
+		["https://api.openai.com/auth"] = { chatgpt_user_id = user, chatgpt_account_id = "acct-1", chatgpt_plan_type = plan },
+		["https://api.openai.com/profile"] = { email = user .. "@example.com" },
+	}
+	return "eyJhbGciOiJub25lIn0." .. crypto.base64url(env.tern.json.encode(claims)) .. ".sig"
+end
+
+local function gpt_usage(session: number, weekly: number): string
+	local now = os.time()
+	return string.format(
+		[[{"user_id":"user-1","account_id":"acct-1","email":"user-1@example.com","plan_type":"plus","rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"used_percent":%d,"limit_window_seconds":18000,"reset_after_seconds":3600,"reset_at":%d},"secondary_window":{"used_percent":%d,"limit_window_seconds":604800,"reset_at":%d}},"code_review_rate_limit":{"primary_window":{"used_percent":5,"limit_window_seconds":604800,"reset_at":%d}},"credits":{"has_credits":true,"unlimited":false,"balance":"12.5"}}]],
+		session,
+		now + 3600,
+		weekly,
+		now + 3 * 86400,
+		now + 3 * 86400
+	)
+end
+
+local function is_wham(c: any): boolean
+	return c.url == "https://chatgpt.com/backend-api/wham/usage"
+end
+
+-- ── Codex CLI: expired login is refreshed and written back; the GPT tab shows it ──
+do
+	local env = fake.new()
+	__fresh(env)
+	local auth = "/home/test/.codex/auth.json"
+	env.files[auth] = env.tern.json.encode({
+		auth_mode = "chatgpt",
+		tokens = { access_token = gpt_token(env, os.time() - 10, "user-1", "plus"), refresh_token = "crt-old", id_token = "idt-old", account_id = "acct-1" },
+		last_refresh = "2026-01-01T00:00:00Z",
+	})
+	env.process = base_process
+	local new_access = gpt_token(env, os.time() + 86400, "user-1", "plus")
+	env.fetch = function(url: string, opts: any): any
+		if url == "https://auth.openai.com/oauth/token" then
+			local body = env.tern.json.decode(opts.body)
+			eq(body.grant_type, "refresh_token", "codex grant")
+			eq(body.refresh_token, "crt-old", "codex refresh token sent")
+			eq(body.client_id, "app_EMoamEEZ73f0CkXaXp7hrann", "codex client id")
+			return ok(env.tern.json.encode({ access_token = new_access, refresh_token = "crt-new", id_token = "idt-new" }))
+		elseif is_wham({ url = url }) then
+			eq(opts.headers.Authorization, "Bearer " .. new_access, "wham uses the refreshed token")
+			eq(opts.headers["ChatGPT-Account-Id"], "acct-1", "wham names the account")
+			return ok(gpt_usage(12, 30))
+		end
+		error("unexpected fetch " .. url)
+	end
+	require("../host")
+	env.drain()
+
+	local saved = env.tern.json.decode(env.files[auth])
+	eq(saved.tokens.access_token, new_access, "write-back access")
+	eq(saved.tokens.refresh_token, "crt-new", "write-back rotated refresh")
+	eq(saved.tokens.id_token, "idt-new", "write-back id token")
+	eq(saved.tokens.account_id, "acct-1", "account id kept")
+	eq(saved.auth_mode, "chatgpt", "other fields kept")
+	assert(saved.last_refresh ~= "2026-01-01T00:00:00Z", "last_refresh bumped")
+	eq(count(env.calls.process, function(c)
+		return c.argv[1] == "chmod" and c.argv[3] == auth
+	end), 1, "auth.json stays 600")
+
+	local s = env.kv.status
+	eq(s.provider, "claude", "Claude is the default tab")
+	eq(#s.accounts, 1, "one GPT row")
+	eq(s.accounts[1].provider, "gpt", "row provider")
+	eq(s.accounts[1].plan, "Plus", "plan from the payload")
+	eq(s.accounts[1].session.pct, 12, "gpt 5h")
+	eq(s.accounts[1].weekly.pct, 30, "gpt 7d")
+
+	-- The status line shows the chosen provider only: nothing while Claude has no account.
+	require("../window")
+	local pane = { pane = 1, cwd = "", program = "", title = "" }
+	eq(env.status_fn(pane), nil, "no Claude account, no segment")
+
+	local cx = env.cx(1)
+	local st = env.blocks.usage.init(cx, {}, nil)
+	local function key(name: string)
+		return env.blocks.usage.key(st, { name = name, ctrl = false, alt = false, shift = false, meta = false }, cx)
+	end
+	env.drain()
+	assert(string.find(render(env, st, cx), "还没有 Claude 账户", 1, true), "Claude tab empty")
+	eq(key("tab"), true, "Tab switches")
+	eq(env.kv.settings.provider, "gpt", "tab choice persisted as the default")
+	eq(env.kv.status.provider, "gpt", "status follows the tab")
+	local text = render(env, st, cx)
+	for _, want in { "user-1@example.com", "Plus", "Codex CLI", "5h", "12%", "7d", "30%", "7d Review", "余额", "12.5" } do
+		assert(string.find(text, want, 1, true), "GPT tab shows " .. want .. " in: " .. text)
+	end
+	assert(not string.find(text, "还没有", 1, true), "GPT tab not empty")
+	eq(env.blocks.usage.title(st), "GPT 5h 12% · 7d 30%", "title follows the tab")
+	env.advance(16000)
+	local segs = env.status_fn(pane)
+	assert(segs and string.find(segs[1].text, "^GPT 5h 12%% %(") and string.find(segs[1].text, "· 7d 30%", 1, true), "GPT segment: " .. tostring(segs and segs[1].text))
+
+	-- 'c' on the GPT tab toggles the Codex source, not Claude Code.
+	key("c")
+	env.drain()
+	eq(env.kv.settings.codex, false, "codex source off")
+	eq(env.kv.settings.claude_code, true, "claude code untouched")
+	assert(string.find(render(env, st, cx), "还没有 GPT 账户", 1, true), "GPT tab empty without the source")
+
+	-- A clicked tab switches back.
+	env.blocks.usage.event(st, { ev = "action", act = "tab", value = "claude" }, cx)
+	eq(env.kv.status.provider, "claude", "click switches")
+	print("codex refresh + tabs: ok")
+end
+
+-- ── omp ChatGPT rows: same account as Codex shows once; an expired omp row isn't refreshed ──
+do
+	local env = fake.new()
+	__fresh(env)
+	env.kv.settings = { provider = "gpt" }
+	env.files["/home/test/.codex/auth.json"] = env.tern.json.encode({
+		tokens = { access_token = gpt_token(env, os.time() + 86400, "user-1", "plus"), refresh_token = "crt", account_id = "acct-1" },
+	})
+	env.files["/home/test/.omp/agent/agent.db"] = "sqlite"
+	local rows = env.tern.json.encode({
+		{ id = 5, provider = "openai-codex", data = env.tern.json.encode({ access = gpt_token(env, os.time() + 86400, "user-1", "plus"), refresh = "r", expires = NOW_MS + 86400000, accountId = "acct-1", email = "user-1@example.com" }) },
+		{ id = 6, provider = "openai-codex", data = env.tern.json.encode({ access = gpt_token(env, os.time() - 10, "user-2", "pro"), refresh = "r2", expires = NOW_MS - 10000, accountId = "acct-1", email = "user-2@example.com" }) },
+	})
+	env.process = function(argv: { string }, opts: any): any
+		if argv[1] == "sqlite3" then
+			assert(string.find(argv[5], "'openai-codex'", 1, true), "omp query reads ChatGPT rows")
+			return { status = 0, stdout = rows, stderr = "", timed_out = false }
+		end
+		return base_process(argv, opts)
+	end
+	env.fetch = function(url: string, _opts: any): any
+		if is_wham({ url = url }) then
+			return ok(gpt_usage(1, 2))
+		end
+		error("unexpected fetch " .. url)
+	end
+	require("../host")
+	env.drain()
+	eq(count(env.calls.fetch, is_wham), 1, "duplicate account fetched once, expired omp row not at all")
+	local cx = env.cx(1)
+	local st = env.blocks.usage.init(cx, {}, nil)
+	local text = render(env, st, cx)
+	assert(string.find(text, "另有 1 个来源指向同一账户", 1, true), "duplicate note: " .. text)
+	assert(string.find(text, "omp 中的登录已过期：在 omp 里重新登录", 1, true), "expired omp row: " .. text)
+	assert(not string.find(text, "用 l 登录", 1, true), "no Claude login hint for GPT rows")
+	assert(string.find(text, "Pro", 1, true), "plan from the token claim before any usage")
+	print("omp gpt: ok")
 end

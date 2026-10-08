@@ -1,10 +1,12 @@
--- Pure modules: hashing/PKCE, ISO time, usage payload normalization, pasted-code parsing.
+-- Pure modules: hashing/PKCE, base64url/JWT, ISO time, usage payload normalization (Claude and
+-- ChatGPT), pasted-code parsing.
 
 local fake = require("./fake_tern")
 local env = fake.new()
 __fresh(env)
 
 local crypto = require("../lib/crypto")
+local codex = require("../lib/codex")
 local time = require("../lib/time")
 local usage = require("../lib/usage")
 local oauth = require("../lib/oauth")
@@ -37,6 +39,15 @@ end
 eq(crypto.base64url(crypto.sha256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk")), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM", "pkce S256")
 eq(crypto.base64url(string.char(0xfb, 0xff, 0xfe, 0x01)), "-__-AQ", "base64url unpadded")
 eq(crypto.unhex(" 0a ff\n10 "), "\10\255\16", "unhex skips whitespace")
+for _, raw in { "", "a", "ab", "abc", "abcd", "\0\255\128", table.concat(all) } do
+	eq(crypto.base64url_decode(crypto.base64url(raw)), raw, "base64url round trip of " .. #raw .. " bytes")
+end
+eq(crypto.base64url_decode("+/8="), "\251\255", "standard alphabet with padding")
+eq(crypto.base64url_decode("a.b"), nil, "not base64")
+local claims = codex.claims("h." .. crypto.base64url('{"exp":5,"https://api.openai.com/auth":{"chatgpt_plan_type":"plus"}}') .. ".sig")
+assert(claims)
+eq(claims.exp, 5, "jwt exp")
+eq(codex.claims("opaque-token"), nil, "not a jwt")
 
 local p = oauth.pkce(string.rep("\1", 64))
 eq(#p.verifier, 64, "verifier length")
@@ -138,6 +149,49 @@ eq(usage.pace({ id = "x", label = "", kind = "session", pct = 0, resets_at = nil
 eq(usage.plan("default_claude_max_20x", nil, nil), "Max 20x", "tier plan")
 eq(usage.plan(nil, "max", nil), "Max", "subscription plan")
 eq(usage.plan(nil, nil, "claude_pro"), "Pro", "org type plan")
+
+-- A real wham/usage body (Pro Lite: only a 7-day primary window, nulls kept as the server sends).
+local gpt = usage.parse_codex(env.tern.json.decode([[{
+ "user_id": "user-1", "account_id": "acct-1", "email": "a@b.c", "plan_type": "prolite",
+ "rate_limit": {"allowed": true, "limit_reached": false,
+  "primary_window": {"used_percent": 9, "limit_window_seconds": 604800, "reset_after_seconds": 506912, "reset_at": 1791972757},
+  "secondary_window": null},
+ "code_review_rate_limit": null, "additional_rate_limits": null,
+ "credits": {"has_credits": false, "unlimited": false, "overage_limit_reached": false, "balance": "0"},
+ "rate_limit_reset_credits": {"available_count": 1}
+}]]), now)
+assert(gpt, "wham payload parses")
+eq(#gpt.windows, 1, "weekly-only plan")
+eq(gpt.windows[1].id, "7d", "primary named by its length, not its slot")
+eq(gpt.windows[1].kind, "weekly", "7d is the weekly window")
+eq(gpt.windows[1].duration, usage.WEEK, "duration from limit_window_seconds")
+eq(gpt.windows[1].resets_at, 1791972757, "absolute reset")
+eq(gpt.plan, "Pro Lite", "plan label")
+eq(gpt.credits, nil, "no credits row without credits")
+
+-- 7d primary + 5h secondary list shortest first; relative resets; review and extra limits; credits.
+local mixed = usage.parse_codex({
+	plan_type = "team",
+	rate_limit = {
+		primary_window = { used_percent = 40, limit_window_seconds = usage.WEEK, reset_after_seconds = 100 },
+		secondary_window = { used_percent = 101, limit_window_seconds = 5 * 3600, reset_at = now + 60 },
+	},
+	code_review_rate_limit = { primary_window = { used_percent = 3, limit_window_seconds = usage.WEEK } },
+	additional_rate_limits = { { limit_name = "Spark", rate_limit = { primary_window = { used_percent = 7, limit_window_seconds = 3600 } } } },
+	credits = { has_credits = true, balance = "12.5" },
+}, now)
+assert(mixed)
+eq(#mixed.windows, 4, "main, review and extra windows")
+eq(mixed.windows[1].id, "5h", "5h first")
+eq(mixed.windows[1].kind, "session", "5h is the session window")
+eq(mixed.windows[1].pct, 100, "pct clamped")
+eq(mixed.windows[2].resets_at, now + 100, "relative reset resolved against now")
+eq(mixed.windows[3].short, "7d Review", "review short label")
+eq(mixed.windows[3].label, "7 天 · Review", "review label")
+eq(mixed.windows[4].short, "1h Spark", "extra limit short label")
+eq(mixed.credits.balance, 12.5, "string balance")
+eq(mixed.plan, "Team", "team plan")
+eq(usage.parse_codex({ hello = 1 }, now), nil, "not a wham body")
 
 -- Pasted codes.
 local c, s = oauth.parse_pasted("  abc123#st4te \n")
