@@ -1,7 +1,7 @@
 --!strict
 -- Where OAuth tokens come from:
---   own          Claude accounts this plugin logged in; stored in <data>/accounts.json (mode 600);
---                refreshed here.
+--   own          Claude and ChatGPT accounts this plugin logged in; stored in <data>/accounts.json
+--                (mode 600; rows without `provider` are Claude); refreshed here.
 --   claude-code  Claude Code's login (macOS Keychain "Claude Code-credentials", else
 --                <config>/.credentials.json); refreshed only once expired, and the rotated pair
 --                is written back so Claude Code stays logged in.
@@ -73,7 +73,16 @@ function M.own_list(): { Account }
 	end
 	for _, a in doc.accounts do
 		if type(a) == "table" and type(a.id) == "string" and type(a.tokens) == "table" and type(a.tokens.access) == "string" then
-			table.insert(out, { id = a.id, provider = "claude", kind = "own", tokens = a.tokens, tier = a.tier, added_at = a.added_at })
+			local gpt = a.provider == "gpt"
+			table.insert(out, {
+				id = a.id,
+				provider = if gpt then "gpt" else "claude",
+				kind = "own",
+				tokens = a.tokens,
+				tier = a.tier,
+				subscription = if gpt then codex.plan_claim(a.tokens) else nil,
+				added_at = a.added_at,
+			})
 		end
 	end
 	return out
@@ -82,26 +91,31 @@ end
 local function own_write(list: { Account })
 	local rows = {}
 	for i, a in list do
-		rows[i] = { id = a.id, tokens = a.tokens, tier = a.tier, added_at = a.added_at }
+		rows[i] = { id = a.id, provider = a.provider, tokens = a.tokens, tier = a.tier, added_at = a.added_at }
 	end
 	local path = own_path()
 	tern.fs.write(path, tern.json.encode({ accounts = tern.json.array(rows) }, true))
 	pcall(tern.process.run, { "chmod", "600", path }, {}, function(_r) end)
 end
 
--- Adds or replaces (same account and organization) a logged-in account; returns its id.
-function M.own_upsert(tokens: Tokens): string
+-- Adds or replaces (same provider, account and organization) a logged-in account; returns its id.
+function M.own_upsert(provider: string, tokens: Tokens): string
 	local list = M.own_list()
 	for _, a in list do
 		local t = a.tokens :: Tokens
-		if t.account_uuid and t.account_uuid == tokens.account_uuid and t.org_uuid == tokens.org_uuid then
+		if a.provider == provider and t.account_uuid and t.account_uuid == tokens.account_uuid and t.org_uuid == tokens.org_uuid then
 			a.tokens = tokens
 			own_write(list)
 			return a.id
 		end
 	end
-	local id = "own:" .. crypto.hex(crypto.sha256((tokens.account_uuid or tokens.access) .. "|" .. (tokens.org_uuid or ""))):sub(1, 12)
-	table.insert(list, { id = id, provider = "claude", kind = "own", tokens = tokens, added_at = os.time() })
+	-- Claude ids keep the original formula so existing accounts.json rows match.
+	local seed = (tokens.account_uuid or tokens.access) .. "|" .. (tokens.org_uuid or "")
+	if provider ~= "claude" then
+		seed = provider .. "|" .. seed
+	end
+	local id = "own:" .. crypto.hex(crypto.sha256(seed)):sub(1, 12)
+	table.insert(list, { id = id, provider = provider, kind = "own", tokens = tokens, added_at = os.time() })
 	own_write(list)
 	return id
 end

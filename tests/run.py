@@ -76,7 +76,8 @@ def main() -> int:
         with tempfile.NamedTemporaryFile("w", suffix=".luau", delete=False) as f:
             f.write(bundle(test))
             out = f.name
-        r = subprocess.run(["luau", out], capture_output=True, text=True)
+        # Luau cuts long error messages at a byte limit, possibly inside a UTF-8 sequence.
+        r = subprocess.run(["luau", out], capture_output=True, text=True, errors="replace")
         status = "ok" if r.returncode == 0 else "FAIL"
         print(f"{status:4} {test.relative_to(ROOT)}")
         if r.stdout.strip():

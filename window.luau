@@ -1,15 +1,24 @@
 --!strict
--- Window half: palette commands that pop the usage block up as a floating panel, and a
--- status-line segment fed by the host poller's summary in kv "status", showing the provider
--- picked by the block's tabs.
+-- Window half: palette commands that pop the usage block up as a floating panel (and start a
+-- Claude or ChatGPT login), and a status-line segment fed by the host poller's summary in kv
+-- "status". The segment shows the block's current tab or both providers, and per provider the
+-- pinned account (else the first), the one with the most headroom, or every account.
 
+local stats = require("./lib/stats")
 local time = require("./lib/time")
 local KIND = "claude-usage.usage"
 
-type Window = { pct: number?, resets_at: number? }
-type Row = { provider: string?, label: string?, plan: string?, error: string?, session: Window?, weekly: Window? }
+type Summary = {
+	updated: number?,
+	rev: number?,
+	enabled: boolean?,
+	provider: string?,
+	mode: string?,
+	scope: string?,
+	accounts: { stats.Row },
+}
 
-local summary: { updated: number?, enabled: boolean?, provider: string?, accounts: { Row } }? = nil
+local summary: Summary? = nil
 
 local function read_summary(): boolean
 	local ok, s = pcall(tern.kv.get, "status")
@@ -17,25 +26,20 @@ local function read_summary(): boolean
 		return false
 	end
 	local prev = summary :: any
-	local changed = prev == nil or prev.updated ~= s.updated or prev.provider ~= s.provider
+	local changed = prev == nil or prev.updated ~= s.updated or prev.rev ~= s.rev or prev.provider ~= s.provider
 	summary = s
 	return changed
 end
 
-local function pct(w: Window?): string
+local function pct(w: stats.Win?): string
 	if w == nil or w.pct == nil then
 		return "—"
 	end
 	return string.format("%d%%", math.floor((w.pct :: number) + 0.5))
 end
 
-local function tone(row: Row): string?
-	local worst = 0
-	for _, w in { row.session, row.weekly } do
-		if w and w.pct then
-			worst = math.max(worst, w.pct :: number)
-		end
-	end
+local function tone(row: stats.Row): string?
+	local worst = stats.load(row) or 0
 	if worst >= 85 then
 		return "error"
 	elseif worst >= 60 then
@@ -47,48 +51,105 @@ end
 -- Claude's segment keeps its bare `5h 42% (2h13m) · 7d 18%`; others are prefixed with their name.
 local PREFIX = { claude = "", gpt = "GPT " }
 local NAME = { claude = "Claude", gpt = "GPT" }
+local PROVIDERS = { "claude", "gpt" }
+-- "all" mode: at most this many accounts per provider, then `+N`.
+local MAX_ALL = 4
+
+type Segment = { text: string, icon: string?, tone: string?, command: string? }
+
+local function segment(text: string, tone_name: string?): Segment
+	return { text = text, icon = "sparkle", tone = tone_name, command = "plugin.claude-usage.open" }
+end
+
+-- `5h 42% (2h13m) · 7d 18%`: the first window present (5 h, else 7 d for plans without one)
+-- carries the reset countdown when `countdown`.
+local function windows_text(row: stats.Row, now: number, countdown: boolean): string
+	local parts: { string } = {}
+	for _, item in { { "5h", row.session }, { "7d", row.weekly } } do
+		local w: stats.Win? = item[2]
+		if w then
+			local part = item[1] .. " " .. pct(w)
+			local at = w.resets_at
+			if countdown and #parts == 0 and at and at > now then
+				part ..= " (" .. time.short(at - now) .. ")"
+			end
+			table.insert(parts, part)
+		end
+	end
+	return table.concat(parts, " · ")
+end
+
+local function provider_segments(provider: string, rows: { stats.Row }, mode: string, now: number): { Segment }
+	local out: { Segment } = {}
+	local picked = stats.pick(rows, mode)
+	if mode == "all" then
+		for i, row in picked do
+			if i > MAX_ALL then
+				out[#out].text ..= string.format(" +%d", #picked - MAX_ALL)
+				break
+			end
+			local prefix = if i == 1 then PREFIX[provider] or "" else ""
+			if row.session == nil and row.weekly == nil then
+				if row.error then
+					table.insert(out, segment(prefix .. (row.name or "") .. " ⚠", "error"))
+				end
+			else
+				-- `me 42%/18%`: the 5 h / 7 d use without labels.
+				local parts: { string } = {}
+				for _, w in { row.session, row.weekly } do
+					if w then
+						table.insert(parts, pct(w))
+					end
+				end
+				table.insert(out, segment(prefix .. (row.name or "") .. " " .. table.concat(parts, "/"), tone(row)))
+			end
+		end
+		return out
+	end
+	local row = picked[1]
+	if row == nil then
+		return out
+	end
+	if row.session == nil and row.weekly == nil then
+		if row.error then
+			table.insert(out, segment((NAME[provider] or provider) .. " ⚠", "error"))
+		end
+		return out
+	end
+	-- "best" names the account it picked; "one" shows the pinned or first account as before.
+	local name = if mode == "best" then (row.name or "") .. " " else ""
+	local text = (PREFIX[provider] or "") .. name .. windows_text(row, now, true)
+	if #rows > 1 then
+		text ..= string.format(" +%d", #rows - 1)
+	end
+	table.insert(out, segment(text, tone(row)))
+	return out
+end
 
 tern.chrome.status(function(_pane)
 	local s = summary
 	if s == nil or s.enabled == false then
 		return nil
 	end
-	local provider = s.provider or "claude"
-	local rows: { Row } = {}
-	for _, r in s.accounts do
-		if (r.provider or "claude") == provider then
-			table.insert(rows, r)
-		end
-	end
-	local row = rows[1]
-	if row == nil then
-		return nil
-	end
-	if row.session == nil and row.weekly == nil then
-		if row.error then
-			return { { text = (NAME[provider] or provider) .. " ⚠", icon = "sparkle", tone = "error", command = "plugin.claude-usage.open" } }
-		end
-		return nil
-	end
+	local shown = s.provider or "claude"
+	local mode = s.mode or "one"
 	local now = os.time()
-	-- The first window present (5 h, else 7 d for plans without one) carries the reset countdown.
-	local parts: { string } = {}
-	for _, item in { { "5h", row.session }, { "7d", row.weekly } } do
-		local w: Window? = item[2]
-		if w then
-			local part = item[1] .. " " .. pct(w)
-			local at = w.resets_at
-			if #parts == 0 and at and at > now then
-				part ..= " (" .. time.short(at - now) .. ")"
+	local out: { Segment } = {}
+	for _, provider in PROVIDERS do
+		if s.scope ~= "both" and provider ~= shown then
+			continue
+		end
+		local rows: { stats.Row } = {}
+		for _, r in s.accounts do
+			if (r.provider or "claude") == provider then
+				table.insert(rows, r)
 			end
-			table.insert(parts, part)
+		end
+		for _, seg in provider_segments(provider, rows, mode, now) do
+			table.insert(out, seg)
 		end
 	end
-	local text = (PREFIX[provider] or "") .. table.concat(parts, " · ")
-	if #rows > 1 then
-		text ..= string.format(" +%d", #rows - 1)
-	end
-	return { { text = text, icon = "sparkle", tone = tone(row), command = "plugin.claude-usage.open" } }
+	return if #out > 0 then out else nil
 end)
 
 -- The countdown in the segment moves by the minute; the data by the host's poll.
@@ -149,16 +210,21 @@ tern.command({
 	end,
 })
 
-tern.command({
-	id = "login",
-	title = "Claude 用量：登录订阅账户",
-	icon = "sparkle",
-	run = function(cx)
-		-- Launch arguments only reach a new block, so an open panel is replaced.
-		local panel, focused = find_panel(cx)
-		if panel then
-			cx.layout:close(panel.pane)
-		end
-		pop_up(cx, focused, { "login" })
-	end,
-})
+-- Launch arguments only reach a new block, so an open panel is replaced.
+local function login_command(id: string, title: string, provider: string)
+	tern.command({
+		id = id,
+		title = title,
+		icon = "sparkle",
+		run = function(cx)
+			local panel, focused = find_panel(cx)
+			if panel then
+				cx.layout:close(panel.pane)
+			end
+			pop_up(cx, focused, { "login", provider })
+		end,
+	})
+end
+
+login_command("login", "Claude 用量：登录订阅账户（可添加多个）", "claude")
+login_command("login-gpt", "GPT 用量：登录 ChatGPT 账户（可添加多个）", "gpt")

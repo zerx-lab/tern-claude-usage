@@ -1,6 +1,7 @@
 -- Host and window halves against a scripted runtime: refresh, 401 retry, 429 backoff, Claude Code
--- and Codex write-back, duplicate accounts, both login paths, the block view with its Claude / GPT
--- tabs and the status segment.
+-- and Codex write-back, duplicate accounts, Claude and ChatGPT logins, the block view with its
+-- Claude / GPT tabs, several accounts (summary, layouts, aliases, hiding, ordering) and the status
+-- segment's modes.
 
 local fake = require("./fake_tern")
 local crypto = require("../lib/crypto")
@@ -608,7 +609,251 @@ do
 	local text = render(env, st, cx)
 	assert(string.find(text, "另有 1 个来源指向同一账户", 1, true), "duplicate note: " .. text)
 	assert(string.find(text, "omp 中的登录已过期：在 omp 里重新登录", 1, true), "expired omp row: " .. text)
-	assert(not string.find(text, "用 l 登录", 1, true), "no Claude login hint for GPT rows")
 	assert(string.find(text, "Pro", 1, true), "plan from the token claim before any usage")
 	print("omp gpt: ok")
+end
+
+-- ── ChatGPT login through the loopback listener; the new account refreshes against OpenAI ──
+do
+	local env = fake.new()
+	__fresh(env)
+	env.kv.settings = { provider = "gpt" }
+	local opened: string? = nil
+	env.process = function(argv: { string }, opts: any): any
+		if argv[1] == "od" then
+			return { status = 0, stdout = string.rep("5a ", 64), stderr = "", timed_out = false }
+		elseif argv[1] == "nc" then
+			eq(argv[3], "1455", "Codex listener port")
+			return "pending"
+		elseif argv[1] == "open" then
+			opened = argv[2]
+			return { status = 0, stdout = "", stderr = "", timed_out = false }
+		end
+		return base_process(argv, opts)
+	end
+	local exchange_body: string? = nil
+	local refresh_body: any = nil
+	local fresh = gpt_token(env, os.time() + 86400, "user-9", "pro")
+	env.fetch = function(url: string, opts: any): any
+		if url == "https://auth.openai.com/oauth/token" then
+			if opts.headers["Content-Type"] == "application/x-www-form-urlencoded" then
+				exchange_body = opts.body
+				-- An access token that is already stale: the first poll must refresh it.
+				return ok(env.tern.json.encode({ access_token = gpt_token(env, os.time() - 10, "user-9", "pro"), refresh_token = "grt-1", id_token = "gid-1" }))
+			end
+			refresh_body = env.tern.json.decode(opts.body)
+			return ok(env.tern.json.encode({ access_token = fresh, refresh_token = "grt-2" }))
+		elseif is_wham({ url = url }) then
+			eq(opts.headers.Authorization, "Bearer " .. fresh, "wham with the refreshed own token")
+			return ok(gpt_usage(33, 44))
+		end
+		error("unexpected fetch " .. url)
+	end
+	require("../host")
+	env.drain()
+	local cx = env.cx(1)
+	local st = env.blocks.usage.init(cx, {}, nil)
+	assert(string.find(render(env, st, cx), "按 l 登录 ChatGPT 账户", 1, true), "GPT empty state offers login")
+	env.blocks.usage.key(st, { name = "l", ctrl = false, alt = false, shift = false, meta = false }, cx)
+	env.advance(500)
+	eq(st.flow.provider, "gpt", "l on the GPT tab logs in to ChatGPT")
+	assert(opened and string.find(opened :: string, "^https://auth%.openai%.com/oauth/authorize%?"), "OpenAI authorize page: " .. tostring(opened))
+	assert(string.find(opened :: string, "redirect_uri=http%3A%2F%2Flocalhost%3A1455%2Fauth%2Fcallback", 1, true), "Codex redirect")
+	assert(string.find(opened :: string, "prompt=login", 1, true), "account chooser forced")
+	local state = string.match(opened :: string, "[?&]state=([%x]+)")
+	env.pending.nc({ status = 0, stdout = "GET /auth/callback?code=G-CODE&state=" .. state .. " HTTP/1.1\r\n\r\n", stderr = "", timed_out = false })
+	env.drain()
+	assert(exchange_body, "code exchanged")
+	assert(string.find(exchange_body :: string, "grant_type=authorization_code", 1, true), "form grant")
+	assert(string.find(exchange_body :: string, "code=G-CODE", 1, true), "form code")
+	assert(string.find(exchange_body :: string, "code_verifier=", 1, true), "form verifier")
+	assert(refresh_body, "stale own GPT token refreshed")
+	eq(refresh_body.refresh_token, "grt-1", "OpenAI refresh with the stored token")
+	local stored = env.tern.json.decode(env.files["/data/accounts.json"])
+	eq(stored.accounts[1].provider, "gpt", "own row remembers its provider")
+	eq(stored.accounts[1].tokens.refresh, "grt-2", "rotated GPT refresh token persisted")
+	local row = env.kv.status.accounts[1]
+	eq(row.provider, "gpt", "status row provider")
+	eq(row.session.pct, 33, "own GPT usage polled")
+	eq(env.toasts[#env.toasts].text, "ChatGPT 账户已登录", "toast names ChatGPT")
+	print("gpt login: ok")
+end
+
+-- Three Claude accounts with different usage (a busy, b idle, c used up) plus one ChatGPT login.
+local function multi_env(): any
+	local env = fake.new()
+	__fresh(env)
+	local rows = {}
+	for _, n in { "a", "b", "c" } do
+		table.insert(rows, { id = "own:" .. n, added_at = 1, tokens = { access = "sk-" .. n, refresh = "rt-" .. n, expires = NOW_MS + 3600000, account_uuid = "acc-" .. n, org_uuid = "org-" .. n, email = n .. "@example.com" } })
+	end
+	env.files["/data/accounts.json"] = env.tern.json.encode({ accounts = rows })
+	env.files["/home/test/.codex/auth.json"] = env.tern.json.encode({
+		tokens = { access_token = gpt_token(env, os.time() + 86400, "user-1", "plus"), refresh_token = "crt", account_id = "acct-1" },
+	})
+	env.process = base_process
+	local load = { ["sk-a"] = { 90, 50 }, ["sk-b"] = { 10, 20 }, ["sk-c"] = { 100, 40 } }
+	env.fetch = function(url: string, opts: any): any
+		local who = string.match(opts.headers.Authorization or "", "^Bearer (.+)$") or ""
+		local n = string.match(who, "^sk%-(%a)$")
+		if string.find(url, "/api/oauth/usage", 1, true) then
+			return ok(payload(load[who][1], load[who][2]))
+		elseif string.find(url, "/api/oauth/profile", 1, true) then
+			return ok(string.format([[{"account":{"uuid":"acc-%s","email":"%s@example.com"},"organization":{"uuid":"org-%s","rate_limit_tier":"default_claude_max_5x"}}]], n, n, n))
+		elseif is_wham({ url = url }) then
+			return ok(gpt_usage(12, 30))
+		end
+		error("unexpected fetch " .. url)
+	end
+	return env
+end
+
+local function status_texts(env: any): { string }
+	env.advance(16000)
+	local out = {}
+	for _, seg in env.status_fn({ pane = 1, cwd = "", program = "", title = "" }) or {} do
+		table.insert(out, seg.text)
+	end
+	return out
+end
+
+-- ── several accounts: summary, compact layout, status-line modes and scope ──
+do
+	local env = multi_env()
+	require("../host")
+	require("../window")
+	env.drain()
+	local cx = env.cx(1)
+	local st = env.blocks.usage.init(cx, {}, nil)
+	local function key(name: string, shift: boolean?)
+		return env.blocks.usage.key(st, { name = name, ctrl = false, alt = false, shift = shift == true, meta = false }, cx)
+	end
+	local function act(name: string, value: string?)
+		env.blocks.usage.event(st, { ev = "action", act = name, value = value }, cx)
+	end
+
+	-- Auto layout: three accounts get compact rows, the summary and the selected account's card.
+	local text = render(env, st, cx)
+	for _, want in { "汇总", "可用 2/3", "最空闲", "最早恢复", "j/k 选择" } do
+		assert(string.find(text, want, 1, true), "multi view shows " .. want .. " in: " .. text)
+	end
+	local v = env.blocks.usage.view(st, cx)
+	local list = nil
+	for _, c in v.main.c do
+		if c.p and c.p.key == "list" then
+			list = c
+		end
+	end
+	assert(list and #list.c == 3, "one compact row per account")
+
+	-- "one": the first account, with the count of the others.
+	local segs = status_texts(env)
+	eq(#segs, 1, "one segment")
+	assert(string.find(segs[1], "^5h 90%% %(") and string.find(segs[1], "+2$"), "first account: " .. segs[1])
+	-- Pinning b moves the segment to it.
+	key("j")
+	key("p")
+	assert(string.find(status_texts(env)[1], "^5h 10%%"), "pinned account on the status line")
+	-- "best": the account with the most headroom, named.
+	act("set", "status_mode:best")
+	assert(string.find(status_texts(env)[1], "^b 5h 10%%"), "best account: " .. status_texts(env)[1])
+	-- "all": one segment per account; "both" adds ChatGPT's.
+	act("set", "status_mode:all")
+	segs = status_texts(env)
+	eq(#segs, 3, "every Claude account")
+	eq(segs[2], "b 10%/20%", "compact per-account segment")
+	act("set", "status_scope:both")
+	segs = status_texts(env)
+	eq(#segs, 4, "both providers")
+	eq(segs[4], "GPT user-1 12%/30%", "GPT segment in both scope")
+	print("multi summary + status: ok")
+end
+
+-- ── per-account preferences: rename, hide, move, sort, cards layout ──
+do
+	local env = multi_env()
+	require("../host")
+	env.drain()
+	local cx = env.cx(1)
+	local st = env.blocks.usage.init(cx, {}, nil)
+	local function key(name: string, opts: any?)
+		local o = opts or {}
+		return env.blocks.usage.key(st, { name = name, text = o.text, ctrl = false, alt = false, shift = o.shift == true, meta = false }, cx)
+	end
+	local function names(): string
+		local out = {}
+		for _, r in env.kv.status.accounts do
+			if r.provider == "claude" then
+				table.insert(out, r.name)
+			end
+		end
+		return table.concat(out, ",")
+	end
+	eq(names(), "a,b,c", "source order")
+
+	-- Rename b: the alias shows in the panel and on the status line, keyed by the account.
+	key("j")
+	key("e")
+	assert(string.find(render(env, st, cx), "重命名", 1, true), "rename box")
+	key("W", { text = "W" })
+	key("o", { text = "o" })
+	key("backspace")
+	key("paste", { text = "ork" })
+	key("enter")
+	eq(st.edit, nil, "rename closed")
+	eq(names(), "a,Work,c", "alias published")
+	eq(env.kv.prefs["claude|acc-b|org-b"].alias, "Work", "alias stored under the account identity")
+	assert(string.find(render(env, st, cx), "Work", 1, true), "alias shown")
+	-- Clearing the alias restores the email.
+	key("e")
+	for _ = 1, 4 do
+		key("backspace")
+	end
+	key("enter")
+	eq(names(), "a,b,c", "alias cleared")
+
+	-- Sort by usage; moving an account then switches to manual order, starting from the one shown.
+	env.blocks.usage.event(st, { ev = "action", act = "set", value = "sort:usage" }, cx)
+	eq(names(), "c,a,b", "busiest first")
+	env.blocks.usage.event(st, { ev = "action", act = "select", value = "own:b" }, cx)
+	eq(st.sel, 3, "click selects")
+	key("K", { shift = true })
+	eq(names(), "c,b,a", "moved up")
+	eq(env.kv.settings.sort, "manual", "manual order")
+	eq(st.sel, 2, "selection follows the moved account")
+
+	-- Hide a: off the status line, the summary and the polling; listed again with a.
+	env.blocks.usage.event(st, { ev = "action", act = "hide", value = "own:a" }, cx)
+	eq(names(), "c,b", "hidden account left off the status line")
+	local before = count(env.calls.fetch, function(c)
+		return is_usage(c) and c.opts.headers.Authorization == "Bearer sk-a"
+	end)
+	key("r")
+	env.drain()
+	eq(count(env.calls.fetch, function(c)
+		return is_usage(c) and c.opts.headers.Authorization == "Bearer sk-a"
+	end), before, "hidden account not polled")
+	local text = render(env, st, cx)
+	assert(string.find(text, "1 个账户已隐藏", 1, true), "hidden note: " .. text)
+	assert(not string.find(text, "a@example.com", 1, true), "hidden account not listed")
+	key("a")
+	assert(string.find(render(env, st, cx), "已隐藏", 1, true), "hidden account listed on demand")
+	env.blocks.usage.event(st, { ev = "action", act = "hide", value = "own:a" }, cx)
+	env.drain()
+	eq(names(), "c,b,a", "unhidden account back in its place")
+
+	-- Explicit cards layout; a wide pane puts the cards side by side.
+	env.blocks.usage.event(st, { ev = "action", act = "set", value = "layout:cards" }, cx)
+	cx.cols = 130
+	local v = env.blocks.usage.view(st, cx)
+	local grid = nil
+	for _, c in v.main.c do
+		if c.p and c.p.key == "grid" then
+			grid = c
+		end
+	end
+	assert(grid and #grid.c == 3, "three cards in the grid")
+	key("v")
+	eq(env.kv.settings.layout, "compact", "v cycles the layout")
+	print("prefs + layouts: ok")
 end

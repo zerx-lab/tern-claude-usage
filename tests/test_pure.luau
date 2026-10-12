@@ -212,4 +212,44 @@ eq(rs, "S1", "callback state")
 local _, _, rerr = oauth.parse_callback_request("GET /callback?error=access_denied HTTP/1.1\r\n")
 eq(rerr, "access_denied", "callback error")
 
+-- Cross-account summary: averages, spare capacity, usable count, best account, first recovery.
+local stats = require("../lib/stats")
+local rows = {
+	{ id = "a", name = "a", session = { pct = 90, resets_at = now + 600 }, weekly = { pct = 50 } },
+	{ id = "b", name = "b", session = { pct = 10 }, weekly = { pct = 20 } },
+	{ id = "c", name = "c", session = { pct = 100, resets_at = now + 7200 }, weekly = { pct = 100, resets_at = now + 86400 } },
+	{ id = "d", name = "d", session = { pct = 100, resets_at = now + 3600 }, weekly = { pct = 40 } },
+	{ id = "e", name = "e", error = "HTTP 500" },
+	{ id = "f", name = "f", session = { pct = 5 }, error = "429" },
+}
+local sum = stats.summarize(rows, now)
+eq(sum.total, 6, "total rows")
+eq(sum.with_data, 5, "rows with data")
+eq(sum.usable, 3, "usable: below 100% on both windows")
+eq(sum.errors, 2, "errors")
+eq(sum.session.n, 5, "5h reporters")
+eq(sum.session.avg, 61, "5h average")
+eq(sum.session.full, 2, "5h used up")
+eq(math.floor(sum.session.spare * 100 + 0.5), 195, "spare 5h windows")
+eq(sum.weekly.max, 100, "7d max")
+eq(sum.best and sum.best.id, "b", "best skips errored rows even when idler")
+eq(sum.recover and sum.recover.id, "d", "d frees up first (c waits for its 7d reset)")
+eq(sum.recover_at, now + 3600, "recovery time")
+eq(stats.load(rows[1]), 90, "load is the higher window")
+eq(stats.load(rows[5]), nil, "no data no load")
+
+eq(stats.pick(rows, "one")[1].id, "a", "one: first row")
+rows[2].pinned = true
+eq(stats.pick(rows, "one")[1].id, "b", "one: pinned row")
+eq(stats.pick(rows, "best")[1].id, "b", "best: most headroom")
+eq(#stats.pick(rows, "all"), 6, "all rows")
+eq(stats.pick({ rows[3] }, "best")[1].id, "c", "best falls back to the first row")
+eq(#stats.pick({}, "one"), 0, "nothing to pick")
+
+-- ChatGPT login URL: Codex client, fixed loopback redirect, offline access.
+local gurl = codex.authorize_url(p, codex.REDIRECT)
+assert(string.find(gurl, "^https://auth%.openai%.com/oauth/authorize%?response_type=code&client_id=app_EMoamEEZ73f0CkXaXp7hrann"), gurl)
+assert(string.find(gurl, "scope=openid%20profile%20email%20offline_access", 1, true), gurl)
+assert(string.find(gurl, "code_challenge=" .. p.challenge, 1, true), gurl)
+
 print("pure: all passed")

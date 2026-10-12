@@ -1,6 +1,6 @@
 --!strict
--- ChatGPT subscription (Codex) access: JWT claims of the OAuth tokens, token refresh against
--- auth.openai.com (the public Codex CLI client), and `GET /backend-api/wham/usage`.
+-- ChatGPT subscription (Codex) access: JWT claims of the OAuth tokens, the PKCE login and token
+-- refresh against auth.openai.com (the public Codex CLI client), and `GET /backend-api/wham/usage`.
 --
 -- Token fields map onto the shared `oauth.Tokens`: `account_uuid` is the ChatGPT user id,
 -- `org_uuid` the ChatGPT account (workspace) id the usage request names in `ChatGPT-Account-Id`.
@@ -16,6 +16,11 @@ M.USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 M.SCOPE = "openid profile email"
 M.USER_AGENT = "codex_cli_rs/0.142.5"
 M.ORIGINATOR = "codex_cli_rs"
+M.AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize"
+-- The client only accepts this redirect; there is no page that shows the code for pasting.
+M.CALLBACK_PORT = 1455
+M.REDIRECT = "http://localhost:1455/auth/callback"
+M.LOGIN_SCOPE = "openid profile email offline_access"
 
 local AUTH_CLAIM = "https://api.openai.com/auth"
 local PROFILE_CLAIM = "https://api.openai.com/profile"
@@ -103,6 +108,62 @@ function M.refresh(t: oauth.Tokens, cb: (oauth.Tokens?, string?, boolean?) -> ()
 			return
 		end
 		cb(nil, oauth.describe(r), not r.error and (r.status == 400 or r.status == 401))
+	end)
+end
+
+-- The authorize page of a Codex-style login; `prompt=login` lets the user pick another account
+-- than the one the browser is signed in to.
+function M.authorize_url(p: oauth.Pkce, redirect: string): string
+	local q = {
+		{ "response_type", "code" },
+		{ "client_id", M.CLIENT_ID },
+		{ "redirect_uri", redirect },
+		{ "scope", M.LOGIN_SCOPE },
+		{ "code_challenge", p.challenge },
+		{ "code_challenge_method", "S256" },
+		{ "id_token_add_organizations", "true" },
+		{ "codex_cli_simplified_flow", "true" },
+		{ "state", p.state },
+		{ "originator", M.ORIGINATOR },
+		{ "prompt", "login" },
+	}
+	local parts = table.create(#q)
+	for i, kv in q do
+		parts[i] = kv[1] .. "=" .. crypto.urlencode(kv[2])
+	end
+	return M.AUTHORIZE_URL .. "?" .. table.concat(parts, "&")
+end
+
+-- Exchanges an authorization code (form-encoded, as the Codex CLI does). `cb(tokens, err)`.
+function M.exchange(code: string, p: oauth.Pkce, redirect: string, cb: (oauth.Tokens?, string?) -> ())
+	local fields = {
+		{ "grant_type", "authorization_code" },
+		{ "code", code },
+		{ "redirect_uri", redirect },
+		{ "client_id", M.CLIENT_ID },
+		{ "code_verifier", p.verifier },
+	}
+	local parts = table.create(#fields)
+	for i, kv in fields do
+		parts[i] = kv[1] .. "=" .. crypto.urlencode(kv[2])
+	end
+	local headers = { ["Content-Type"] = "application/x-www-form-urlencoded", Accept = "application/json", ["User-Agent"] = M.USER_AGENT }
+	tern.fetch(M.TOKEN_URL, { method = "POST", headers = headers, body = table.concat(parts, "&"), timeout_ms = 60000 }, function(r)
+		if r.error or r.status < 200 or r.status >= 300 then
+			cb(nil, oauth.describe(r))
+			return
+		end
+		local ok, decoded = pcall(tern.json.decode, r.body)
+		local access = if ok and type(decoded) == "table" then str(decoded.access_token) else nil
+		if not access then
+			cb(nil, "令牌响应无法解析")
+			return
+		end
+		local t = M.tokens(access :: string, str(decoded.refresh_token), str(decoded.id_token), nil)
+		if t.expires == nil and type(decoded.expires_in) == "number" then
+			t.expires = os.time() * 1000 + decoded.expires_in * 1000
+		end
+		cb(t, nil)
 	end)
 end
 

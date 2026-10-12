@@ -6,10 +6,14 @@
 -- `wham/usage`), one after another. It ticks every `settings.interval` seconds while a usage block
 -- is open and every `settings.background` seconds otherwise. A 429 backs that account off
 -- (Retry-After, else doubling from one minute) and keeps showing the last good data.
+--
+-- Per-account preferences (kv "prefs", keyed by account identity): an alias, hidden (not shown,
+-- not polled, not on the status line), pinned (the status line's account) and a manual order.
 
 local codex = require("./codex")
 local creds = require("./creds")
 local oauth = require("./oauth")
+local stats = require("./stats")
 local usage = require("./usage")
 
 local M = {}
@@ -46,12 +50,52 @@ export type Settings = {
 	status_line: boolean,
 	-- The tab blocks open on and the status line shows: "claude" | "gpt".
 	provider: string,
+	-- Account list: "auto" (cards up to two accounts, else compact rows) | "cards" | "compact".
+	layout: string,
+	-- "manual" | "usage" (busiest first) | "reset" (soonest reset first) | "name".
+	sort: string,
+	-- Status line: "one" (pinned, else first) | "best" (most headroom) | "all".
+	status_mode: string,
+	-- Status line providers: "tab" (the shown one) | "both".
+	status_scope: string,
+	-- Card details: pace text, sparklines, per-model and other windows.
+	show_pace: boolean,
+	show_history: boolean,
+	show_scoped: boolean,
+	-- Whether hidden accounts are listed (dimmed) so they can be shown again.
+	show_hidden: boolean,
 }
 
-local DEFAULTS: Settings = { interval = 60, background = 300, claude_code = true, codex = true, omp = true, status_line = true, provider = "claude" }
+export type Pref = { alias: string?, hidden: boolean?, pinned: boolean?, order: number? }
+
+local DEFAULTS: Settings = {
+	interval = 60,
+	background = 300,
+	claude_code = true,
+	codex = true,
+	omp = true,
+	status_line = true,
+	provider = "claude",
+	layout = "auto",
+	sort = "manual",
+	status_mode = "one",
+	status_scope = "tab",
+	show_pace = true,
+	show_history = true,
+	show_scoped = true,
+	show_hidden = false,
+}
 M.PROVIDERS = { "claude", "gpt" }
 M.PROVIDER_NAME = { claude = "Claude", gpt = "GPT" }
 M.INTERVALS = { 30, 60, 120, 300, 600 }
+-- Allowed values of the enumerated settings.
+M.CHOICES = {
+	provider = M.PROVIDERS,
+	layout = { "auto", "cards", "compact" },
+	sort = { "manual", "usage", "reset", "name" },
+	status_mode = { "one", "best", "all" },
+	status_scope = { "tab", "both" },
+}
 local HISTORY = 48
 
 local state = {
@@ -63,6 +107,9 @@ local state = {
 	ticking = false,
 	started = false,
 	last_tick = nil :: number?,
+	prefs = {} :: { [string]: Pref },
+	-- Bumped on every status publish so the window notices changes within a second.
+	rev = 0,
 }
 M.state = state
 
@@ -76,19 +123,27 @@ local function load_settings()
 	local ok, s = pcall(tern.kv.get, "settings")
 	if ok and type(s) == "table" then
 		for k, v in s do
-			if (DEFAULTS :: any)[k] ~= nil and type(v) == type((DEFAULTS :: any)[k]) then
+			local allowed = (M.CHOICES :: any)[k]
+			if (DEFAULTS :: any)[k] ~= nil and type(v) == type((DEFAULTS :: any)[k]) and (allowed == nil or table.find(allowed, v)) then
 				(state.settings :: any)[k] = v
 			end
 		end
 	end
-	if not M.PROVIDER_NAME[state.settings.provider] then
-		state.settings.provider = DEFAULTS.provider
+end
+
+local function load_prefs()
+	local ok, p = pcall(tern.kv.get, "prefs")
+	if ok and type(p) == "table" then
+		for k, v in p do
+			if type(k) == "string" and type(v) == "table" then
+				state.prefs[k] = v
+			end
+		end
 	end
 end
 
-function M.set_setting(key: string, value: any)
-	(state.settings :: any)[key] = value
-	pcall(tern.kv.set, "settings", state.settings)
+local function save_prefs()
+	pcall(tern.kv.set, "prefs", state.prefs)
 end
 
 local function save_cache()
@@ -121,31 +176,35 @@ local function load_cache()
 	end
 end
 
--- Compact status for the window half's status line, in kv "status": every account's 5 h / 7 d
--- windows, and the provider the line shows.
+-- Compact status for the window half's status line, in kv "status": every shown account's 5 h /
+-- 7 d windows in panel order (hidden accounts left out), and how the line picks among them.
 local function publish()
 	local accounts = {}
-	for _, e in state.entries do
-		if e.duplicate_of or e.account.problem then
-			continue
-		end
-		local row: { [string]: any } = { provider = e.account.provider, label = M.label(e), plan = M.plan(e), error = e.error }
-		if e.usage then
-			for _, w in (e.usage :: usage.Usage).windows do
-				if w.id == "5h" or w.id == "7d" then
-					row[if w.id == "5h" then "session" else "weekly"] = { pct = w.pct, resets_at = w.resets_at }
-				end
+	for _, p in M.PROVIDERS do
+		for _, e in M.ordered(p, false) do
+			if not e.account.problem then
+				table.insert(accounts, M.row(e))
 			end
-			row.fetched_at = e.fetched_at
 		end
-		table.insert(accounts, row)
 	end
+	state.rev += 1
 	pcall(tern.kv.set, "status", {
 		updated = os.time(),
+		rev = state.rev,
 		accounts = tern.json.array(accounts),
 		enabled = state.settings.status_line,
 		provider = state.settings.provider,
+		mode = state.settings.status_mode,
+		scope = state.settings.status_scope,
 	})
+end
+
+-- Persists a setting; the status line and open blocks follow at once.
+function M.set_setting(key: string, value: any)
+	(state.settings :: any)[key] = value
+	pcall(tern.kv.set, "settings", state.settings)
+	publish()
+	M.notify()
 end
 
 -- ── listeners ───────────────────────────────────────────────────────────────
@@ -184,11 +243,27 @@ end
 
 -- ── labels ──────────────────────────────────────────────────────────────────
 
-function M.label(e: Entry): string
+-- The account's own name: its email, else what the source calls it.
+function M.account_name(e: Entry): string
 	local p = e.profile
 	local t = e.account.tokens
 	local fallback = if e.account.kind == "claude-code" then "Claude Code 账户" elseif e.account.kind == "codex" then "Codex 账户" else e.account.id
 	return (p and p.email) or (t and t.email) or fallback
+end
+
+-- The alias the user gave the account, else its own name.
+function M.label(e: Entry): string
+	return M.pref(e).alias or M.account_name(e)
+end
+
+-- For tight spots (status line, compact rows): the alias, else the email's local part.
+function M.short_name(e: Entry): string
+	local alias = M.pref(e).alias
+	if alias then
+		return alias
+	end
+	local name = M.account_name(e)
+	return string.match(name, "^([^@]+)@") or name
 end
 
 -- Claude: the live profile wins over tier hints a credential store saved at login time.
@@ -200,6 +275,30 @@ function M.plan(e: Entry): string?
 	end
 	local p = e.profile
 	return usage.plan((p and p.tier) or e.account.tier, e.account.subscription, p and p.org_type)
+end
+
+-- The account's compact row: what the status line and the cross-account summary read.
+function M.row(e: Entry): stats.Row
+	local row: stats.Row = {
+		id = e.account.id,
+		provider = e.account.provider,
+		label = M.label(e),
+		name = M.short_name(e),
+		plan = M.plan(e),
+		error = e.error,
+		pinned = if M.pref(e).pinned then true else nil,
+	}
+	if e.usage then
+		for _, w in (e.usage :: usage.Usage).windows do
+			if w.id == "5h" then
+				row.session = { pct = w.pct, resets_at = w.resets_at }
+			elseif w.id == "7d" then
+				row.weekly = { pct = w.pct, resets_at = w.resets_at }
+			end
+		end
+		row.fetched_at = e.fetched_at
+	end
+	return row
 end
 
 local function identity(e: Entry): string?
@@ -224,6 +323,130 @@ local function mark_duplicates()
 			end
 		end
 	end
+end
+
+-- ── preferences ─────────────────────────────────────────────────────────────
+
+local NO_PREF: Pref = table.freeze({} :: Pref)
+
+-- Preferences follow the account (provider, user, organization), so they survive a source
+-- switching logins and apply to whichever source shows it; before the identity is known they
+-- sit under the source's account id.
+function M.pref(e: Entry): Pref
+	local id = identity(e)
+	return (if id then state.prefs[id] else nil) or state.prefs[e.account.id] or NO_PREF
+end
+
+local function pref_slot(e: Entry): Pref
+	local key = identity(e) or e.account.id
+	local p: Pref? = state.prefs[key]
+	if p == nil then
+		local moved: Pref = state.prefs[e.account.id] or {} :: Pref
+		state.prefs[e.account.id] = nil
+		state.prefs[key] = moved
+		return moved
+	end
+	return p :: Pref
+end
+
+local function prefs_changed()
+	for k, p in state.prefs do
+		if next(p :: any) == nil then
+			state.prefs[k] = nil
+		end
+	end
+	save_prefs()
+	publish()
+	M.notify()
+end
+
+function M.set_alias(e: Entry, alias: string?)
+	local text = alias and string.match(alias, "^%s*(.-)%s*$")
+	pref_slot(e).alias = if text and text ~= "" then text else nil
+	prefs_changed()
+end
+
+function M.set_hidden(e: Entry, hidden: boolean)
+	pref_slot(e).hidden = if hidden then true else nil
+	prefs_changed()
+end
+
+-- Pins `e` as its provider's status-line account (one per provider), or unpins it.
+function M.set_pinned(e: Entry, pinned: boolean)
+	for _, o in state.entries do
+		if o.account.provider == e.account.provider and M.pref(o).pinned then
+			pref_slot(o).pinned = nil
+		end
+	end
+	if pinned then
+		pref_slot(e).pinned = true
+	end
+	prefs_changed()
+end
+
+local function first_reset(e: Entry): number?
+	local u = e.usage
+	if u then
+		for _, w in (u :: usage.Usage).windows do
+			if (w.id == "5h" or w.id == "7d") and w.resets_at then
+				return w.resets_at
+			end
+		end
+	end
+	return nil
+end
+
+-- One provider's accounts in panel order (`settings.sort`), one per real account; hidden ones
+-- only with `with_hidden`.
+function M.ordered(provider: string, with_hidden: boolean?): { Entry }
+	local list: { Entry } = {}
+	local base: { [Entry]: number } = {}
+	for i, e in state.entries do
+		if not e.duplicate_of and e.account.provider == provider and (with_hidden or not M.pref(e).hidden) then
+			table.insert(list, e)
+			base[e] = i
+		end
+	end
+	local mode = state.settings.sort
+	local key: { [Entry]: any } = {}
+	for _, e in list do
+		if mode == "usage" then
+			key[e] = -(stats.load(M.row(e)) or -1)
+		elseif mode == "reset" then
+			key[e] = first_reset(e) or math.huge
+		elseif mode == "name" then
+			key[e] = string.lower(M.label(e))
+		else
+			key[e] = M.pref(e).order or math.huge
+		end
+	end
+	table.sort(list, function(x, y)
+		if key[x] ~= key[y] then
+			return key[x] < key[y]
+		end
+		return base[x] < base[y]
+	end)
+	return list
+end
+
+-- Moves `e` by `delta` places in its provider's list, switching to manual order. False at an end.
+function M.move(e: Entry, delta: number): boolean
+	local list = M.ordered(e.account.provider, state.settings.show_hidden)
+	local i = table.find(list, e)
+	local j = if i then i + delta else 0
+	if i == nil or j < 1 or j > #list then
+		return false
+	end
+	list[i], list[j] = list[j], list[i]
+	for n, o in list do
+		pref_slot(o).order = n
+	end
+	if state.settings.sort ~= "manual" then
+		(state.settings :: any).sort = "manual"
+		pcall(tern.kv.set, "settings", state.settings)
+	end
+	prefs_changed()
+	return true
 end
 
 -- ── data ────────────────────────────────────────────────────────────────────
@@ -379,11 +602,11 @@ local function ensure_token(e: Entry, force: boolean, cb: (string?, string?) -> 
 	end
 	local kind = e.account.kind
 	if kind == "omp" then
-		cb(nil, "omp 中的登录已过期：在 omp 里重新登录" .. (if e.account.provider == "claude" then "，或在这里用 l 登录" else ""))
+		cb(nil, "omp 中的登录已过期：在 omp 里重新登录，或在这里用 l 登录")
 		return
 	end
 	local cli = CLI[kind]
-	local refresh = if cli then cli.refresh else oauth.refresh
+	local refresh = if cli then cli.refresh elseif e.account.provider == "gpt" then codex.refresh else oauth.refresh
 	e.busy = "refresh"
 	M.notify()
 	local function do_refresh(current: oauth.Tokens)
@@ -519,7 +742,7 @@ end
 
 -- Fetches one entry's usage. `force` ignores its backoff.
 local function poll_entry(e: Entry, force: boolean, done: () -> ())
-	if e.duplicate_of or e.account.problem or e.busy then
+	if e.duplicate_of or e.account.problem or e.busy or M.pref(e).hidden then
 		done()
 		return
 	end
@@ -650,6 +873,7 @@ function M.start()
 	end
 	state.started = true
 	load_settings()
+	load_prefs()
 	load_cache()
 	M.tick(false)
 end
@@ -675,8 +899,6 @@ function M.set_provider(provider: string)
 		return
 	end
 	M.set_setting("provider", provider)
-	publish()
-	M.notify()
 end
 
 return M
